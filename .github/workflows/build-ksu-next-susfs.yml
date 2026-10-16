@@ -92,12 +92,44 @@ jobs:
 
       - name: Add SUSFS source and apply kernel patch
         working-directory: kernel
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          SUSFS_PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          test -s "$SUSFS_PATCH"
           cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/susfs.c" fs/
           cp "$GITHUB_WORKSPACE"/susfs4ksu/kernel_patches/include/linux/*.h include/linux/
-          patch --batch --forward -p1 \
-            < "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+
+          echo "Applying SUSFS patch to kernel commit: $(git rev-parse --short HEAD)"
+          if patch --batch --forward -p1 < "$SUSFS_PATCH"; then
+            echo "SUSFS kernel patch applied without rejected hunks."
+          else
+            patch_status=$?
+            echo "::error::SUSFS patch failed with status $patch_status. Rejected hunks follow."
+            echo "Patch source: $SUSFS_PATCH"
+            echo "Kernel commit: $(git rev-parse HEAD)"
+            rej_count=0
+            while IFS= read -r -d '' rej; do
+              rej_count=$((rej_count + 1))
+              echo "========== REJECTED FILE: $rej =========="
+              cat "$rej"
+              echo "========== END REJECTED FILE: $rej =========="
+            done < <(find fs include -type f -name '*.rej' -print0)
+            if [ "$rej_count" -eq 0 ]; then
+              echo "No .rej files found. Patch diagnostics:" >&2
+              find . -type f -name '*.rej' -print >&2
+            fi
+            echo "Relevant kernel source context follows."
+            for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h; do
+              if [ -f "$file" ]; then
+                echo "========== SOURCE FILE: $file (first 180 lines) =========="
+                sed -n '1,180p' "$file"
+                echo "========== END SOURCE FILE: $file =========="
+              fi
+            done
+            exit "$patch_status"
+          fi
+
           grep -q 'susfs.o' fs/Makefile || {
             echo 'SUSFS patch did not add susfs.o to fs/Makefile; refusing to guess the correct insertion point.' >&2
             exit 1
