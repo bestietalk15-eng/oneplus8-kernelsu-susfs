@@ -67,13 +67,28 @@ jobs:
         working-directory: kernel
         run: |
           set -euxo pipefail
+          # The setup script expects drivers/kernelsu to be a symlink. If the
+          # kernel tree already has a real directory there, preserve it first;
+          # otherwise ln -sf can create a nested symlink instead of replacing it.
+          if [ -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ]; then
+            backup="drivers/kernelsu.pre-ksun-${GITHUB_RUN_ID:-local}"
+            echo "Existing drivers/kernelsu directory found; preserving it at $backup"
+            mv drivers/kernelsu "$backup"
+          fi
           curl --fail --location --retry 3 \
             'https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh' \
             -o /tmp/ksu-setup.sh
           bash /tmp/ksu-setup.sh legacy
-          test -d drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
-          readlink -f drivers/kernelsu
+          echo 'KernelSU-Next symlink details:'
+          ls -ld drivers/kernelsu
+          KSU_REAL_DIR="$(readlink -f drivers/kernelsu)"
+          echo "Resolved KernelSU-Next path: $KSU_REAL_DIR"
+          test -d "$KSU_REAL_DIR"
+          test -s "$KSU_REAL_DIR/Kconfig" || {
+            echo 'KernelSU-Next Kconfig was not found at the resolved symlink target.' >&2
+            find KernelSU-Next -maxdepth 3 -name Kconfig -print || true
+            exit 1
+          }
 
       - name: Add SUSFS source and apply kernel patch
         working-directory: kernel
