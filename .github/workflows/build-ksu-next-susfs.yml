@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   validate-and-build:
-    name: Validate source, patches and kernel build
+    name: Source, configuration and diagnostic build
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -21,15 +21,24 @@ jobs:
       KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
       KERNEL_BRANCH: event-horizon
       DEVICE: instantnoodlep
-      EXPECTED_ARCH: arm64
+      ARCH: arm64
       OUT: out
+      LLVM: "1"
 
     steps:
+      - name: Prepare artifact directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             bc bison build-essential ccache clang \
             flex git libelf-dev libssl-dev lld llvm \
@@ -37,7 +46,11 @@ jobs:
             zstd dwarves device-tree-compiler \
             patch curl file perl
 
-      - name: Checkout exact Singularity source
+          clang --version
+          ld.lld --version
+          git --version
+
+      - name: Clone exact Singularity source and submodules
         shell: bash
         run: |
           set -euo pipefail
@@ -45,48 +58,86 @@ jobs:
           git clone \
             --branch "$KERNEL_BRANCH" \
             --recurse-submodules \
-            "$KERNEL_SOURCE" kernel
+            "$KERNEL_SOURCE" \
+            kernel
 
           cd kernel
 
-          git checkout "$KERNEL_BRANCH"
-          git submodule update --init --recursive
-
           test "$(git branch --show-current)" = "$KERNEL_BRANCH"
 
-          git rev-parse HEAD | tee ../source-commit.txt
-          git status --short | tee ../source-status.txt
-          git submodule status | tee ../submodules.txt
+          git submodule sync --recursive
+          git submodule update --init --recursive
 
-          grep -q 'KernelSU-Next' .gitmodules || {
-            echo "::error::Expected KernelSU-Next submodule is missing."
-            exit 1
-          }
+          git rev-parse HEAD \
+            | tee "$GITHUB_WORKSPACE/artifacts/kernel-commit.txt"
 
-          test -d KernelSU-Next
-          test -f KernelSU-Next/Makefile || {
-            echo "::error::KernelSU-Next checkout is incomplete."
-            exit 1
-          }
+          git remote -v \
+            > "$GITHUB_WORKSPACE/artifacts/git-remotes.txt"
 
-      - name: Inspect device support and kernel version
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euo pipefail
+          git status --short \
+            > "$GITHUB_WORKSPACE/artifacts/source-status.txt"
 
-          mkdir -p ../artifacts
+          git submodule status \
+            > "$GITHUB_WORKSPACE/artifacts/submodules.txt"
 
           {
             echo "Source: $KERNEL_SOURCE"
             echo "Branch: $KERNEL_BRANCH"
             echo "Device requested: OnePlus 8 Pro"
-            echo "Device codename: $DEVICE"
+            echo "Codename: $DEVICE"
+            echo
+            echo "Kernel commit:"
+            git rev-parse HEAD
+            echo
+            echo "Submodules:"
+            git submodule status
+          } | tee "$GITHUB_WORKSPACE/artifacts/source-audit.txt"
+
+      - name: Validate KernelSU-Next submodule checkout
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          KSU_DIR="KernelSU-Next"
+
+          if [ ! -d "$KSU_DIR" ] ||
+             [ -z "$(ls -A "$KSU_DIR" 2>/dev/null)" ]; then
+            echo "::error::KernelSU-Next submodule is missing or empty."
+            exit 1
+          fi
+
+          KSU_COMMIT="$(git -C "$KSU_DIR" rev-parse HEAD)"
+
+          {
+            echo "KernelSU-Next path: $KSU_DIR"
+            echo "KernelSU-Next commit: $KSU_COMMIT"
+            echo
+            echo "Submodule status:"
+            git submodule status -- "$KSU_DIR"
+            echo
+            echo "Build and configuration files:"
+            find "$KSU_DIR" -maxdepth 4 -type f \
+              \( -name Makefile -o -name Kconfig \) \
+              -print | sort
+          } | tee "$GITHUB_WORKSPACE/artifacts/kernelsu-checkout.txt"
+
+          echo "Submodule checkout verified."
+          echo "Build integration still requires separate verification."
+
+      - name: Audit device configuration and device trees
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Requested device: OnePlus 8 Pro ($DEVICE)"
             echo
             echo "Kernel version:"
-            make kernelversion || true
+            make kernelversion
             echo
-            echo "Matching device and platform configurations:"
+            echo "Device-specific and platform defconfigs:"
             find arch/arm64/configs -type f \
               \( -iname "*instantnoodlep*" \
                  -o -iname "*instantnoodle*" \
@@ -95,196 +146,215 @@ jobs:
               -print | sort
             echo
             echo "Device tree references:"
-            grep -Ril \
-              --exclude-dir=.git \
-              --include='*.dts' \
-              --include='*.dtsi' \
-              'instantnoodlep' arch/arm64/boot/dts \
-              2>/dev/null || true
-          } | tee ../artifacts/device-audit.txt
+            if [ -d arch/arm64/boot/dts ]; then
+              grep -Ril \
+                --include='*.dts' \
+                --include='*.dtsi' \
+                'instantnoodlep' \
+                arch/arm64/boot/dts || true
+            else
+              echo "No arch/arm64/boot/dts directory found."
+            fi
+          } | tee "$GITHUB_WORKSPACE/artifacts/device-audit.txt"
 
-          # Do not assume a shared SoC means shared device support.
-          if ! grep -Ril \
-            --exclude-dir=.git \
-            --include='*defconfig' \
-            'instantnoodlep' arch/arm64/configs \
-            > ../artifacts/device-defconfig-matches.txt; then
-            : > ../artifacts/device-defconfig-matches.txt
+          if find arch/arm64/configs -type f \
+            -iname '*instantnoodlep*' -print -quit \
+            | grep -q .; then
+            echo "Explicit device-named defconfig found." \
+              > "$GITHUB_WORKSPACE/artifacts/device-support-status.txt"
+          else
+            {
+              echo "No explicitly named instantnoodlep defconfig found."
+              echo "A Kona defconfig alone does not prove device compatibility."
+            } > "$GITHUB_WORKSPACE/artifacts/device-support-status.txt"
           fi
 
-          if [ ! -s ../artifacts/device-defconfig-matches.txt ]; then
-            echo "::warning::No explicitly named instantnoodlep defconfig found."
-            echo "A verified device-specific configuration is required before packaging."
-          fi
-
-      - name: Verify existing KernelSU-Next integration
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          {
-            echo "KernelSU-Next submodule:"
-            git submodule status -- KernelSU-Next
-            echo
-            echo "KernelSU-related build references:"
-            grep -Rni \
-              --exclude-dir=.git \
-              --exclude='*.o' \
-              --exclude='*.a' \
-              -m 3 'KernelSU-Next' \
-              Makefile Kbuild Kconfig \
-              arch scripts security 2>/dev/null || true
-          } | tee ../artifacts/kernelsu-audit.txt
-
-          # Presence of a directory alone does not prove integration.
-          if ! grep -Rqs \
-            --exclude-dir=.git \
-            --exclude='*.o' \
-            --exclude='*.a' \
-            'KernelSU-Next' \
-            Makefile Kbuild Kconfig \
-            arch scripts security 2>/dev/null; then
-            echo "::error::Could not verify KernelSU-Next build integration."
-            exit 1
-          fi
-
-      - name: Verify SUSFS patch inputs
+      - name: Audit KernelSU-Next integration
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p artifacts
+          cd "$GITHUB_WORKSPACE/kernel"
 
-          # Never claim SUSFS is integrated just because a patch
-          # repository or a directory exists.
           {
-            echo "SUSFS integration audit"
-            echo "Kernel source: $KERNEL_SOURCE"
-            echo "Kernel branch: $KERNEL_BRANCH"
+            echo "KernelSU-Next integration reference audit"
             echo
-            echo "Checking for SUSFS implementation and patch references."
-
-            cd kernel
-
             grep -Rni \
+              --include=Makefile \
+              --include=Kconfig \
+              --include=Kbuild \
               --exclude-dir=.git \
-              --exclude='*.o' \
-              --exclude='*.a' \
-              -m 5 'susfs' \
-              fs include security Kconfig Makefile \
+              --exclude-dir=out \
+              'KernelSU-Next\|KSU' \
+              Makefile Kbuild Kconfig arch scripts security include \
               2>/dev/null || true
-          } | tee artifacts/susfs-audit.txt
+          } > "$GITHUB_WORKSPACE/artifacts/kernelsu-integration-audit.txt"
 
-          echo "SUSFS must be integrated using a compatible 4.19 patch set."
-          echo "This workflow does not silently substitute another kernel or patch."
-          echo "Patch application and config verification are mandatory before release."
+          cat "$GITHUB_WORKSPACE/artifacts/kernelsu-integration-audit.txt"
 
-      - name: Locate an explicit platform defconfig
+          echo
+          echo "Reference matches are evidence for inspection, not proof of a working integration."
+
+      - name: Audit existing SUSFS integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/kernel"
+
+          {
+            echo "SUSFS source and configuration audit"
+            echo
+            grep -Rni \
+              --include=Makefile \
+              --include=Kconfig \
+              --include=Kbuild \
+              --include='*.c' \
+              --include='*.h' \
+              --exclude-dir=.git \
+              --exclude-dir=out \
+              'susfs' \
+              fs include security kernel \
+              2>/dev/null || true
+          } > "$GITHUB_WORKSPACE/artifacts/susfs-audit.txt"
+
+          cat "$GITHUB_WORKSPACE/artifacts/susfs-audit.txt"
+
+          echo
+          echo "This step audits existing references only."
+          echo "It does not apply SUSFS patches or claim SUSFS is integrated."
+
+      - name: Select available Kona diagnostic defconfig
         id: config
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          # This is a platform candidate, NOT proof of OnePlus 8 Pro
-          # compatibility. It is selected only for diagnostic building.
-          if [ -f arch/arm64/configs/vendor/kona-perf_defconfig ]; then
-            DEFCONFIG=vendor/kona-perf_defconfig
-          elif [ -f arch/arm64/configs/kona-perf_defconfig ]; then
-            DEFCONFIG=kona-perf_defconfig
-          else
-            echo "::error::No expected Kona platform defconfig found."
-            echo "Review artifacts/device-audit.txt."
+          DEFCONFIG="$(
+            find arch/arm64/configs -type f \
+              -iname '*kona*defconfig' \
+              -print | sort | head -n 1
+          )"
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "::error::No Kona diagnostic defconfig was found."
             exit 1
           fi
 
-          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
-          echo "Selected platform candidate: $DEFCONFIG"
+          DEFCONFIG="${DEFCONFIG#arch/arm64/configs/}"
 
-      - name: Configure diagnostic kernel
+          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+
+          echo "Selected diagnostic defconfig: $DEFCONFIG" \
+            | tee "$GITHUB_WORKSPACE/artifacts/selected-defconfig.txt"
+
+          echo "WARNING: This platform configuration is not proof of OnePlus 8 Pro support."
+
+      - name: Configure diagnostic kernel and retain LKM support
         shell: bash
         working-directory: kernel
+        env:
+          DEFCONFIG: ${{ steps.config.outputs.defconfig }}
         run: |
           set -euo pipefail
 
-          make O="$OUT" ARCH=arm64 \
-            "$DEFCONFIG"
+          make O="$OUT" ARCH="$ARCH" LLVM="$LLVM" "$DEFCONFIG"
 
-          # Preserve module-loading infrastructure. Do not blindly
-          # convert every =m entry to =y: Kconfig dependencies and
-          # device requirements must determine each driver's state.
-          scripts/config --file "$OUT/.config" --enable MODULES
-
-          make O="$OUT" ARCH=arm64 olddefconfig
-
-          grep -qx 'CONFIG_MODULES=y' "$OUT/.config" || {
-            echo "::error::LKM support is not enabled."
+          test -f scripts/config || {
+            echo "::error::scripts/config is missing."
             exit 1
           }
 
-          mkdir -p ../artifacts
-          cp "$OUT/.config" ../artifacts/kernel.config
+          scripts/config \
+            --file "$OUT/.config" \
+            --enable MODULES
+
+          make O="$OUT" ARCH="$ARCH" LLVM="$LLVM" olddefconfig
+
+          if ! grep -qx 'CONFIG_MODULES=y' "$OUT/.config"; then
+            echo "::error::LKM support is not enabled in the resolved configuration."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          cp "$OUT/.config" \
+            "$GITHUB_WORKSPACE/artifacts/kernel.config"
 
           grep -E '^CONFIG_[A-Za-z0-9_]+=m$' "$OUT/.config" \
-            > ../artifacts/modular-options.txt || true
+            > "$GITHUB_WORKSPACE/artifacts/modular-options.txt" || true
 
-          grep -E '^CONFIG_(MODULES|KSU|KSU_SUSFS)=' \
+          grep -E \
+            '^CONFIG_(MODULES|KSU|KSU_SUSFS)(=|_)' \
             "$OUT/.config" \
-            > ../artifacts/security-config.txt || true
+            > "$GITHUB_WORKSPACE/artifacts/security-config.txt" || true
 
-      - name: Compile diagnostic kernel
+          {
+            echo "Resolved defconfig: $DEFCONFIG"
+            echo "CONFIG_MODULES:"
+            grep '^CONFIG_MODULES=' "$OUT/.config"
+            echo
+            echo "Configured module count:"
+            grep -c -E '^CONFIG_[A-Za-z0-9_]+=m$' "$OUT/.config" || true
+          } | tee "$GITHUB_WORKSPACE/artifacts/configuration-status.txt"
+
+          echo "Note: LKM infrastructure is retained."
+          echo "Drivers are not blindly converted from modules to built-ins."
+
+      - name: Compile diagnostic kernel, device trees and modules
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          # First test the selected source/config/toolchain combination.
-          # This is a diagnostic build until device support and SUSFS
-          # have been independently verified.
           make -j"$(nproc)" \
             O="$OUT" \
-            ARCH=arm64 \
-            Image.gz dtbs modules
+            ARCH="$ARCH" \
+            LLVM="$LLVM" \
+            Image.gz dtbs modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
 
-      - name: Validate diagnostic artifacts
+      - name: Validate diagnostic build outputs
+        if: success()
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          mkdir -p ../artifacts
-
+          ARTIFACTS="$GITHUB_WORKSPACE/artifacts"
           IMAGE="$OUT/arch/arm64/boot/Image.gz"
 
           test -s "$IMAGE" || {
-            echo "::error::Image.gz is missing or empty."
+            echo "::error::Expected Image.gz was not produced."
             exit 1
           }
 
-          file "$IMAGE" | tee ../artifacts/image-file.txt
-          sha256sum "$IMAGE" | tee ../artifacts/image-sha256.txt
-          cp "$IMAGE" ../artifacts/Image.gz
+          file "$IMAGE" | tee "$ARTIFACTS/image-file.txt"
+          sha256sum "$IMAGE" | tee "$ARTIFACTS/image-sha256.txt"
 
-          # Record module output without pretending that these modules
-          # are automatically compatible with every target ROM.
-          MODULES_DIR="$OUT"
-          find "$MODULES_DIR" -type f -name '*.ko' -print \
-            | sort > ../artifacts/modules-list.txt
+          cp "$IMAGE" "$ARTIFACTS/Image.gz"
 
-          git rev-parse HEAD > ../artifacts/kernel-commit.txt
-          git submodule status > ../artifacts/submodules.txt
+          find "$OUT" -type f -name '*.ko' -print | sort \
+            > "$ARTIFACTS/modules-list.txt"
+
+          find "$OUT" -type f -name '*.dtb' -print | sort \
+            > "$ARTIFACTS/dtb-list.txt"
+
+          git rev-parse HEAD > "$ARTIFACTS/kernel-commit.txt"
+          git submodule status > "$ARTIFACTS/submodules.txt"
 
           {
-            echo "Result: diagnostic build only"
-            echo "Device: $DEVICE"
-            echo "LKM infrastructure: checked"
-            echo "SUSFS: not release-verified by this workflow"
-            echo "Device boot test: not performed"
-            echo "Flashable ZIP: intentionally not generated"
-          } > ../artifacts/build-status.txt
+            echo "Diagnostic kernel compilation: passed"
+            echo "Kernel image exists: yes"
+            echo "LKM support: CONFIG_MODULES=y verified"
+            echo "KernelSU-Next: checkout verified; integration not yet proven"
+            echo "SUSFS: not integrated or release-verified by this workflow"
+            echo "OnePlus 8 Pro boot test: not performed"
+            echo "Flashable ZIP: not generated"
+          } | tee "$ARTIFACTS/build-status.txt"
 
-      - name: Upload diagnostic artifacts
+      - name: Upload validation artifacts and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -292,3 +362,18 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Summarize validation status
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Singularity Event Horizon Validation"
+            echo
+            echo "- Source: \`$KERNEL_SOURCE\`"
+            echo "- Branch: \`$KERNEL_BRANCH\`"
+            echo "- Requested device: \`$DEVICE\`"
+            echo "- This workflow is diagnostic only."
+            echo "- No flashable ZIP is produced."
+            echo "- SUSFS integration and device compatibility require further verification."
+          } >> "$GITHUB_STEP_SUMMARY"
