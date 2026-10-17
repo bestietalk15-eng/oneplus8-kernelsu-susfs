@@ -34,7 +34,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             bc \
             bison \
@@ -75,11 +77,14 @@ jobs:
           git checkout "$KERNEL_BRANCH"
           git submodule update --init --recursive
 
-          echo "===== Kernel source ====="
+          echo "===== Source repository ====="
           git remote -v
+
+          echo "===== Source branch ====="
           git branch --show-current
+
+          echo "===== Source commit ====="
           git rev-parse HEAD
-          git status --short
 
           echo "===== Submodule revisions ====="
           git submodule status --recursive
@@ -91,23 +96,19 @@ jobs:
         shell: bash
         working-directory: kernel
         run: |
-          set -euxo pipefail
-
-          if [ -d KernelSU-Next/.git ] || \
-             git submodule status KernelSU-Next 2>/dev/null | grep -q .; then
-            echo "KernelSU-Next directory detected."
-            if [ -d KernelSU-Next ]; then
-              git -C KernelSU-Next rev-parse HEAD || true
-              git -C KernelSU-Next status --short || true
-            fi
-          else
-            echo "::warning::KernelSU-Next was not detected as a populated submodule."
-          fi
+          set -euo pipefail
 
           if [ -d KernelSU-Next ]; then
+            echo "KernelSU-Next directory found."
+
+            git -C KernelSU-Next rev-parse HEAD 2>/dev/null || true
+            git -C KernelSU-Next status --short 2>/dev/null || true
+
             find KernelSU-Next -maxdepth 2 -type f \
-              \( -name 'Kconfig' -o -name 'Makefile' \) \
+              \( -name Kconfig -o -name Makefile \) \
               -print | head -80 || true
+          else
+            echo "::warning::KernelSU-Next directory not found."
           fi
 
       - name: Audit device and defconfig support
@@ -117,6 +118,7 @@ jobs:
           set -euo pipefail
 
           echo "===== Device references ====="
+
           git grep -niE \
             'instantnoodlep|OnePlus 8 Pro|OnePlus8Pro' \
             HEAD -- \
@@ -125,18 +127,19 @@ jobs:
             '*/instantnoodlep*' \
             2>/dev/null || true
 
-          echo "===== Kona defconfigs ====="
+          echo "===== Available Kona defconfigs ====="
+
           find arch/arm64/configs -type f \
             -iname '*kona*defconfig' -print | sort || true
 
           echo "===== Device tree references ====="
+
           find arch/arm64/boot/dts -type f \
             \( -iname '*kona*' -o -iname '*instantnoodlep*' \) \
             -print 2>/dev/null | head -200 || true
 
-          echo "===== Compatibility warning ====="
-          echo "A Kona defconfig or Snapdragon 865 support alone does not prove"
-          echo "OnePlus 8 Pro compatibility. Device-specific validation is required."
+          echo "===== Compatibility note ====="
+          echo "A Kona defconfig alone does not establish OnePlus 8 Pro compatibility."
 
       - name: Select an available Kona defconfig
         id: config
@@ -145,26 +148,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t DEFCONFIGS < <(
-            find arch/arm64/configs -type f \
-              -iname '*kona*defconfig' | sort
-          )
-
-          if [ "${#DEFCONFIGS[@]}" -eq 0 ]; then
-            echo "::error::No Kona defconfig was found."
-            echo "Refusing to guess a different device configuration."
-            exit 1
-          fi
-
-          printf '%s\n' "${DEFCONFIGS[@]}"
-
+          CONFIG_DIR="arch/arm64/configs"
           SELECTED=""
 
           for candidate in \
-            arch/arm64/configs/vendor/kona-perf_defconfig \
-            arch/arm64/configs/kona-perf_defconfig \
-            arch/arm64/configs/vendor/kona_defconfig \
-            arch/arm64/configs/kona_defconfig
+            "$CONFIG_DIR/vendor/kona-perf_defconfig" \
+            "$CONFIG_DIR/kona-perf_defconfig" \
+            "$CONFIG_DIR/vendor/kona_defconfig" \
+            "$CONFIG_DIR/kona_defconfig"
           do
             if [ -f "$candidate" ]; then
               SELECTED="$candidate"
@@ -173,21 +164,36 @@ jobs:
           done
 
           if [ -z "$SELECTED" ]; then
-            echo "::error::Kona defconfigs exist, but none of the expected names matched."
-            echo "Inspect the listed files and explicitly choose the correct base config."
+            echo "::error::No expected Kona defconfig was found."
+            echo "Available candidates:"
+            find "$CONFIG_DIR" -type f \
+              -iname '*kona*defconfig' -print | sort || true
             exit 1
           fi
 
-          echo "Selected defconfig: $SELECTED"
-          echo "defconfig=$SELECTED" >> "$GITHUB_OUTPUT"
+          # make expects the defconfig name relative to arch/arm64/configs.
+          DEFCONFIG="${SELECTED#"$CONFIG_DIR"/}"
+
+          echo "Selected defconfig file: $SELECTED"
+          echo "Defconfig name for make: $DEFCONFIG"
+
+          test -f "$SELECTED"
+
+          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
 
       - name: Configure kernel with loadable module support
         shell: bash
         working-directory: kernel
+        env:
+          DEFCONFIG: ${{ steps.config.outputs.defconfig }}
         run: |
           set -euxo pipefail
 
+          test -n "$DEFCONFIG"
+
           mkdir -p "$OUT"
+
+          echo "Using defconfig: $DEFCONFIG"
 
           make \
             O="$OUT" \
@@ -196,9 +202,13 @@ jobs:
             LLVM="$LLVM" \
             "$DEFCONFIG"
 
-          test -x scripts/config
+          test -f "$OUT/.config"
 
-          scripts/config --file "$OUT/.config" --enable MODULES
+          # Enable loadable kernel modules without forcing every driver
+          # to be modular or built-in.
+          scripts/config \
+            --file "$OUT/.config" \
+            --enable MODULES
 
           make \
             O="$OUT" \
@@ -207,8 +217,10 @@ jobs:
             LLVM="$LLVM" \
             olddefconfig
 
-          echo "===== Module configuration ====="
-          grep -E '^CONFIG_MODULES=|^# CONFIG_MODULES is not set' \
+          echo "===== Resolved module configuration ====="
+
+          grep -E \
+            '^CONFIG_MODULES=|^# CONFIG_MODULES is not set' \
             "$OUT/.config" || true
 
           if ! grep -qx 'CONFIG_MODULES=y' "$OUT/.config"; then
@@ -219,10 +231,10 @@ jobs:
           cp "$OUT/.config" "$GITHUB_WORKSPACE/kernel-config.txt"
 
           echo "LKM support is enabled."
-          echo "Individual drivers remain built-in or modular according to"
-          echo "their resolved configuration. They cannot be both =y and =m."
+          echo "Drivers can be built in (=y) or as modules (=m), depending"
+          echo "on their individual resolved configuration."
 
-      - name: Fix missing BPF JIT fallback safely
+      - name: Check missing BPF JIT fallback
         shell: bash
         working-directory: kernel
         run: |
@@ -231,7 +243,7 @@ jobs:
           HEADER="include/linux/filter.h"
 
           if [ ! -f "$HEADER" ]; then
-            echo "::error::Missing $HEADER; cannot inspect BPF helper."
+            echo "::error::Missing $HEADER."
             exit 1
           fi
 
@@ -252,15 +264,14 @@ jobs:
           marker = re.search(
               r"^[ \t]*#\s*else\s*/\*\s*CONFIG_BPF_JIT\s*\*/[^\n]*",
               text,
-              flags=re.MULTILINE,
+              re.MULTILINE,
           )
 
           if not marker:
               print(
-                  "::error::Could not find the exact "
-                  "'#else /* CONFIG_BPF_JIT */' section."
+                  "::error::Cannot locate the exact CONFIG_BPF_JIT "
+                  "fallback section. No automatic patch applied."
               )
-              print("No automatic source modification was made.")
               sys.exit(1)
 
           tail = text[marker.end():]
@@ -268,72 +279,60 @@ jobs:
           end_match = re.search(
               r"^[ \t]*#\s*endif\b[^\n]*CONFIG_BPF_JIT[^\n]*",
               tail,
-              flags=re.MULTILINE,
+              re.MULTILINE,
           )
 
           if not end_match:
               print(
-                  "::error::Could not identify the end of the "
-                  "CONFIG_BPF_JIT conditional section."
+                  "::error::Cannot identify the end of the "
+                  "CONFIG_BPF_JIT conditional."
               )
-              print("No automatic source modification was made.")
               sys.exit(1)
 
-          fallback_end = marker.end() + end_match.start()
-          fallback_section = text[marker.end():fallback_end]
-          fallback_signatures = list(
+          section_end = marker.end() + end_match.start()
+          fallback_section = text[marker.end():section_end]
+
+          fallback_definitions = list(
               re.finditer(signature, fallback_section)
           )
+          all_definitions = list(re.finditer(signature, text))
 
-          all_signatures = list(re.finditer(signature, text))
-
-          if len(fallback_signatures) == 1:
-              print("BPF JIT fallback already exists; no change required.")
+          if len(fallback_definitions) == 1:
+              print("BPF JIT fallback already exists.")
               sys.exit(0)
 
-          if len(fallback_signatures) > 1:
+          if len(fallback_definitions) > 1:
               print(
-                  "::error::Multiple BPF helper definitions exist "
-                  "in the CONFIG_BPF_JIT fallback section."
+                  "::error::Multiple fallback definitions detected."
               )
               sys.exit(1)
 
-          if not all_signatures:
+          if len(all_definitions) != 1:
               print(
-                  "::error::No existing helper definition was found. "
-                  "The source may need a different, version-specific fix."
+                  "::error::Unexpected helper definition count. "
+                  "Refusing to modify the source automatically."
               )
               sys.exit(1)
 
-          if len(all_signatures) != 1:
-              print(
-                  "::error::Unexpected number of helper definitions; "
-                  "refusing to guess which one to modify."
-              )
-              sys.exit(1)
-
-          fallback = """
-          static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
-          {
-              return false;
-          }
-
-          """
-
-          updated = (
-              text[:fallback_end]
-              + fallback
-              + text[fallback_end:]
+          fallback = (
+              "\n"
+              "static inline bool bpf_jit_blinding_enabled"
+              "(struct bpf_prog *prog)\n"
+              "{\n"
+              "    return false;\n"
+              "}\n"
+              "\n"
           )
 
+          updated = text[:section_end] + fallback + text[section_end:]
           path.write_text(updated)
 
-          print("Inserted the missing CONFIG_BPF_JIT fallback.")
-          print("The fallback returns false when BPF JIT is disabled.")
+          print("Added missing CONFIG_BPF_JIT fallback.")
           PY
 
-          echo "===== BPF helper definitions after check ====="
-          grep -n -A4 -B2 \
+          echo "===== BPF helper definitions ====="
+
+          grep -n -A5 -B3 \
             'bpf_jit_blinding_enabled' "$HEADER" || true
 
       - name: Audit KernelSU and SUSFS integration
@@ -343,47 +342,39 @@ jobs:
           set -euo pipefail
 
           echo "===== KernelSU references ====="
+
           git grep -niE \
             'KernelSU|kernelsu|ksu_init|CONFIG_KSU' \
             HEAD -- \
-            'Kconfig' \
-            'Makefile' \
+            Kconfig \
+            Makefile \
             'init/*' \
             'drivers/*' \
             'fs/*' \
             2>/dev/null | head -250 || true
 
           echo "===== SUSFS references ====="
+
           git grep -niE \
             'susfs|CONFIG_KSU_SUSFS|ksu_susfs' \
             HEAD -- \
-            'Kconfig' \
-            'Makefile' \
+            Kconfig \
+            Makefile \
             'fs/*' \
             'include/*' \
             'drivers/*' \
             2>/dev/null | head -250 || true
 
-          echo "===== SUSFS integration status ====="
-          if git grep -qiE 'susfs|CONFIG_KSU_SUSFS' HEAD -- \
-            'Kconfig' 'Makefile' 'fs/*' 'include/*' 'drivers/*' \
-            2>/dev/null; then
-            echo "Some SUSFS references exist."
-            echo "This does not prove the required patch set is fully integrated."
-          else
-            echo "::warning::No SUSFS integration references were detected."
-          fi
-
-          echo "No SUSFS patch is claimed as applied by this audit step."
+          echo "This audit does not prove full KernelSU or SUSFS integration."
 
       - name: Build kernel image, device trees, and modules
-        id: build
         shell: bash
         working-directory: kernel
         run: |
           set -uo pipefail
 
           mkdir -p "$OUT"
+
           set +e
 
           make \
@@ -396,16 +387,18 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
           status=${PIPESTATUS[0]}
-          set -e
 
-          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          set -e
 
           if [ "$status" -ne 0 ]; then
             echo "::error::Kernel build failed with exit code $status."
-            echo "===== Relevant compiler diagnostics ====="
+
+            echo "===== Relevant diagnostics ====="
+
             grep -n -B5 -A8 -E \
               'error:|fatal error:|undefined reference|Error [0-9]' \
               "$GITHUB_WORKSPACE/build.log" | tail -250 || true
+
             exit "$status"
           fi
 
@@ -415,31 +408,33 @@ jobs:
         run: |
           set -euxo pipefail
 
-          echo "===== Candidate images ====="
+          echo "===== Candidate boot images ====="
+
           find "$OUT/arch/arm64/boot" -maxdepth 3 -type f \
-            \( -name 'Image' -o -name 'Image.gz' \
-               -o -name 'Image.gz-dtb' -o -name '*.dtb' \
+            \( -name Image -o -name Image.gz \
+               -o -name Image.gz-dtb -o -name '*.dtb' \
                -o -name '*.dtbo' \) \
             -print | sort || true
 
-          echo "===== Built modules ====="
+          echo "===== Kernel modules ====="
+
           find "$OUT" -type f -name '*.ko' -print | sort || true
 
           if [ ! -s "$OUT/arch/arm64/boot/Image.gz" ] && \
              [ ! -s "$OUT/arch/arm64/boot/Image" ]; then
-            echo "::error::No non-empty kernel Image or Image.gz was produced."
+            echo "::error::No non-empty kernel image was produced."
             exit 1
           fi
 
           if [ ! -s "$OUT/.config" ]; then
-            echo "::error::Final kernel configuration is missing."
+            echo "::error::Final .config is missing."
             exit 1
           fi
 
           grep -qx 'CONFIG_MODULES=y' "$OUT/.config"
 
-          echo "Basic artifact checks passed."
-          echo "This does not prove that the kernel boots on instantnoodlep."
+          echo "Artifact checks passed."
+          echo "Boot compatibility is not established by compilation alone."
 
       - name: Collect diagnostic artifacts
         if: always()
@@ -449,15 +444,13 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/diagnostics"
 
-          if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
+          [ ! -f "$GITHUB_WORKSPACE/build.log" ] || \
             cp "$GITHUB_WORKSPACE/build.log" \
               "$GITHUB_WORKSPACE/diagnostics/"
-          fi
 
-          if [ -f "$GITHUB_WORKSPACE/kernel-config.txt" ]; then
+          [ ! -f "$GITHUB_WORKSPACE/kernel-config.txt" ] || \
             cp "$GITHUB_WORKSPACE/kernel-config.txt" \
               "$GITHUB_WORKSPACE/diagnostics/"
-          fi
 
           if [ -d "$GITHUB_WORKSPACE/kernel" ]; then
             (
@@ -480,16 +473,7 @@ jobs:
               "$GITHUB_WORKSPACE/diagnostics/final-kernel.config"
           fi
 
-          if [ -d "$OUT/arch/arm64/boot" ]; then
-            mkdir -p "$GITHUB_WORKSPACE/diagnostics/boot"
-            find "$OUT/arch/arm64/boot" -maxdepth 3 -type f \
-              \( -name 'Image' -o -name 'Image.gz' \
-                 -o -name '*.dtb' -o -name '*.dtbo' \) \
-              -exec cp --parents '{}' \
-                "$GITHUB_WORKSPACE/diagnostics/boot" \; 2>/dev/null
-          fi
-
-      - name: Upload kernel and diagnostics
+      - name: Upload build artifacts and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -514,5 +498,5 @@ jobs:
           echo "Branch: $KERNEL_BRANCH"
           echo "Requested device: $DEVICE"
           echo "LKM support: CONFIG_MODULES=y required"
-          echo "Flashable ZIP: intentionally not generated"
-          echo "Device boot compatibility: not established by compilation alone"
+          echo "Flashable ZIP: not generated"
+          echo "Device boot compatibility: not yet established"
