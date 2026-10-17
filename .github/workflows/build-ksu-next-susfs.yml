@@ -1,379 +1,264 @@
-
-name: Singularity OnePlus 8 Pro Kernel Build
+name: Build Singularity LKM Kernel for OnePlus 8 Pro
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/build.yml"
+    inputs:
+      build_modules:
+        description: "Build and upload .ko modules separately"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
-concurrency:
-  group: singularity-instantnoodlep-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
+  KERNEL_BRANCH: event-horizon
+  DEVICE_CODENAME: instantnoodlep
+  KERNEL_DEFCONFIG: vendor/kona-perf_defconfig
+  ORIGINAL_ZIP: payload/Singularity-original.zip
+  ZIP_NAME: Singularity-event-horizon-instantnoodlep.zip
+  CLANG_URL: https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz
 
 jobs:
   build:
-    name: Build instantnoodlep kernel
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
-
-    env:
-      KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
-      KERNEL_BRANCH: event-horizon
-      DEVICE: instantnoodlep
-      KERNEL_OUT: ${{ github.workspace }}/kernel-out
-      MODULE_STAGING: ${{ github.workspace }}/module-staging
-
     steps:
-      - name: Checkout workflow repository
+      - name: Checkout workflow repository and original installer payload
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Validate original ZIP exists
+        shell: bash
         run: |
           set -euo pipefail
+          if [[ ! -s "$ORIGINAL_ZIP" ]]; then
+            echo "::error::Put the untouched Singularity installer ZIP at $ORIGINAL_ZIP in this workflow repository."
+            exit 1
+          fi
+          unzip -t "$ORIGINAL_ZIP"
+          sha256sum "$ORIGINAL_ZIP" | tee original-zip.sha256
 
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential ca-certificates \
-            clang-14 lld-14 llvm-14 lld \
-            flex git libelf-dev libssl-dev \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            make pahole perl python3 python3-pip \
-            rsync tar xz-utils zstd \
-            device-tree-compiler cpio
+            bc bison build-essential cpio curl flex git libelf-dev libssl-dev \
+            lz4 make python3 python-is-python3 rsync zip unzip dwarves patch \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-          command -v clang-14
-          command -v ld.lld-14
-          command -v ld.lld
-
-      - name: Clone Singularity and initialize submodules
+      - name: Clone Singularity source and submodules
+        shell: bash
         run: |
           set -euo pipefail
+          git clone --recurse-submodules --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
+          test -f kernel/Makefile
+          echo "Kernel commit: $(git -C kernel rev-parse HEAD)"
+          echo "Kernel branch: $(git -C kernel branch --show-current)"
+          git -C kernel submodule status || true
 
-          git clone \
-            --depth=1 \
-            --single-branch \
-            --branch "$KERNEL_BRANCH" \
-            --recurse-submodules \
-            --shallow-submodules \
-            "$KERNEL_SOURCE" kernel
-
-          cd kernel
-
-          echo "Source: $KERNEL_SOURCE"
-          echo "Branch: $(git branch --show-current)"
-          echo "Commit: $(git rev-parse HEAD)"
-
-          git submodule status
-
-          if [ "$(git branch --show-current)" != "$KERNEL_BRANCH" ]; then
-            echo "::error::Unexpected kernel branch."
-            exit 1
-          fi
-
-      - name: Verify and wire existing KernelSU-Next
+      - name: Verify existing KernelSU-Next and SUSFS source integration
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
-
-          KSU_ROOT="KernelSU-Next"
-          KSU_KERNEL="$KSU_ROOT/kernel"
-
-          if [ ! -d "$KSU_ROOT" ]; then
-            echo "::error::KernelSU-Next submodule directory is missing."
-            git submodule status
-            exit 1
-          fi
-
-          if [ ! -f "$KSU_KERNEL/Kconfig" ] ||
-             [ ! -f "$KSU_KERNEL/Makefile" ]; then
-            echo "::error::KernelSU-Next source is incomplete."
-            find "$KSU_ROOT" -maxdepth 3 -type f \
-              | head -100 || true
-            exit 1
-          fi
-
-          echo "KernelSU source found at $KSU_KERNEL"
-
-          if [ ! -e drivers/kernelsu ]; then
-            ln -s ../KernelSU-Next/kernel drivers/kernelsu
-          elif [ -L drivers/kernelsu ]; then
-            echo "Existing KernelSU symlink: $(readlink drivers/kernelsu)"
-          elif [ -d drivers/kernelsu ]; then
-            echo "Existing drivers/kernelsu directory preserved."
+          echo "Checking existing source integration. This workflow does not re-clone KSU or re-apply SUSFS patches."
+          find . -maxdepth 5 \( -iname '*kernelsu*' -o -iname '*ksunext*' \) -print | head -150
+          if [[ -L drivers/kernelsu ]]; then
+            test -e drivers/kernelsu
+          elif [[ -d drivers/kernelsu ]]; then
+            :
           else
-            echo "::error::Invalid drivers/kernelsu path."
+            echo "::error::Existing drivers/kernelsu integration was not found; refusing to invent an integration."
+            exit 1
+          fi
+          test -f drivers/kernelsu/Kconfig
+
+      - name: Download Clang toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl --fail --location --retry 3 "$CLANG_URL" -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          test -x "$RUNNER_TEMP/clang/bin/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version
+
+      - name: Validate defconfig and original ZIP payload structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "kernel/arch/arm64/configs/$KERNEL_DEFCONFIG" || {
+            echo "::error::Defconfig not found: arch/arm64/configs/$KERNEL_DEFCONFIG"
+            find kernel/arch/arm64/configs -maxdepth 4 -type f \( -iname '*kona*' -o -iname '*instantnoodle*' \) -print | head -100
+            exit 1
+          }
+          rm -rf original-payload
+          mkdir original-payload
+          unzip -q "$ORIGINAL_ZIP" -d original-payload
+          find original-payload -type f -print | sort > original-payload-files.txt
+          installer="$(find original-payload -type f -name anykernel.sh -print -quit)"
+          test -n "$installer" || {
+            echo "::error::No anykernel.sh found inside the supplied original ZIP."
+            exit 1
+          }
+          echo "$installer" > installer-path.txt
+          echo "Original installer: $installer"
+          grep -RIl --include='*' 'Image-KSU' original-payload | head -20 || true
+          grep -RIl --include='*' 'Image-NoKSU' original-payload | head -20 || true
+          test -n "$(find original-payload -type f -name 'Image-KSU' -print -quit)" || {
+            echo "::error::Original ZIP does not contain an Image-KSU payload. Refusing to guess the installer filename."
+            exit 1
+          }
+          test -n "$(find original-payload -type f -name 'Image-NoKSU' -print -quit)" || {
+            echo "::error::Original ZIP does not contain an Image-NoKSU payload. Refusing to guess the installer filename."
+            exit 1
+          }
+          test -f "$(dirname "$installer")/tools/ak3-core.sh" || {
+            echo "::error::Expected tools/ak3-core.sh beside the original installer; cannot audit installer helper behavior."
+            exit 1
+          }
+
+      - name: Audit installer partition-write behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$(cat installer-path.txt)"
+          root="$(dirname "$installer")"
+          core="$root/tools/ak3-core.sh"
+
+          # DTBO references for detection/size validation are allowed. Actual
+          # image-write commands targeting DTBO or any non-boot partition are not.
+          if grep -Ein \
+            '(^|[;&|[:space:]])(write_raw_image|flash_image|write_partition|erase_partition|format_partition)[[:space:]]+[^#]*((dtbo|vendor_boot|vbmeta|super|metadata|userdata|system|vendor|product|odm)(_[ab])?([[:space:]]|$))' \
+            "$installer" "$core"; then
+            echo "::error::Installer/helper appears to write a non-boot partition. ZIP build blocked by the boot-only safety requirement."
             exit 1
           fi
 
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::KernelSU Kconfig not found."
+          # AnyKernel scripts may route writes through variables/functions;
+          # do not modify the original script to make the audit pass.
+          if grep -Ein 'write_raw_image|flash_image|write_partition|erase_partition|format_partition' "$installer" "$core"; then
+            echo "::warning::Generic partition-write helpers exist. Confirming boot-only safety requires tracing their call sites."
+          fi
+          if ! grep -Eq 'write_boot|dump_boot' "$installer" "$core"; then
+            echo "::error::Could not find the expected boot-image write path."
             exit 1
           fi
+          echo "Static audit passed for obvious non-boot write commands; installer remains unchanged."
 
-          if ! grep -Fq 'kernelsu/' drivers/Makefile; then
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' \
-              >> drivers/Makefile
-          fi
-
-          if ! grep -Fq 'source "drivers/kernelsu/Kconfig"' \
-              drivers/Kconfig; then
-            python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("drivers/Kconfig")
-          text = path.read_text()
-          entry = 'source "drivers/kernelsu/Kconfig"'
-
-          if entry not in text:
-              marker = "\nendmenu"
-              index = text.rfind(marker)
-
-              if index < 0:
-                  raise SystemExit(
-                      "Cannot safely add KernelSU Kconfig entry."
-                  )
-
-              text = text[:index] + "\n" + entry + "\n" + text[index:]
-              path.write_text(text)
-          PY
-          fi
-
-          echo "=== KernelSU integration ==="
-          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
-
-      - name: Audit existing SUSFS integration
+      - name: Build KSU and non-KSU kernel images with LKM support
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          DEFCONFIG="$KERNEL_DEFCONFIG"
+          mkdir -p out-ksu out-noksu
 
-          git grep -n -i -E \
-            'CONFIG_.*SUSFS|susfs' \
-            -- '*Kconfig*' '*Makefile*' fs include/linux drivers \
-            > ../susfs-audit.txt || true
+          build_variant() {
+            local variant="$1"
+            local outdir="$2"
+            local ksu="$3"
 
-          cat ../susfs-audit.txt || true
+            echo "===== Configure $variant ====="
+            make O="$outdir" "$DEFCONFIG"
+            scripts/config --file "$outdir/.config" --enable MODULES
+            scripts/config --file "$outdir/.config" --enable KALLSYMS
+            scripts/config --file "$outdir/.config" --enable KALLSYMS_ALL
 
-          echo "SUSFS patches will not be reapplied automatically."
-
-      - name: Locate kernel defconfig
-        id: config
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          candidates=(
-            vendor/kona-perf_defconfig
-            kona-perf_defconfig
-            vendor/kona_defconfig
-            kona_defconfig
-            vendor/instantnoodlep_defconfig
-            instantnoodlep_defconfig
-          )
-
-          selected=""
-
-          for candidate in "${candidates[@]}"; do
-            if [ -f "arch/arm64/configs/$candidate" ]; then
-              selected="$candidate"
-              break
+            if [[ "$ksu" == "yes" ]]; then
+              scripts/config --file "$outdir/.config" --enable KSU
+            else
+              scripts/config --file "$outdir/.config" --disable KSU
             fi
-          done
 
-          if [ -z "$selected" ]; then
-            echo "::error::No recognized defconfig found."
-            find arch/arm64/configs -type f \
-              -name '*defconfig' | head -200
-            exit 1
-          fi
-
-          echo "Selected defconfig: $selected"
-          echo "defconfig=$selected" >> "$GITHUB_OUTPUT"
-
-      - name: Configure kernel with LKM support
-        working-directory: kernel
-        env:
-          DEFCONFIG: ${{ steps.config.outputs.defconfig }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$KERNEL_OUT"
-
-          export PATH="/usr/lib/llvm-14/bin:$PATH"
-          export LD=ld.lld-14
-
-          make O="$KERNEL_OUT" \
-            ARCH=arm64 \
-            LLVM=-14 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            "$DEFCONFIG"
-
-          scripts/config --file "$KERNEL_OUT/.config" \
-            --enable MODULES \
-            --enable KPROBES \
-            --enable KALLSYMS \
-            --enable KALLSYMS_ALL \
-            --enable KSU
-
-          make O="$KERNEL_OUT" \
-            ARCH=arm64 \
-            LLVM=-14 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
-
-          cp "$KERNEL_OUT/.config" ../kernel-config.txt
-
-          grep -E \
-            '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_KSU|CONFIG_KALLSYMS)=' \
-            "$KERNEL_OUT/.config" || true
-
-          for option in MODULES KPROBES KSU; do
-            if ! grep -qx "CONFIG_${option}=y" \
-                "$KERNEL_OUT/.config"; then
-              echo "::error::CONFIG_${option}=y is unavailable."
+            make -j"$(nproc --all)" O="$outdir" olddefconfig
+            grep -q '^CONFIG_MODULES=y$' "$outdir/.config" || {
+              echo "::error::CONFIG_MODULES=y did not survive olddefconfig for $variant."
               exit 1
+            }
+            if [[ "$ksu" == "yes" ]]; then
+              grep -q '^CONFIG_KSU=y$' "$outdir/.config" || {
+                echo "::error::CONFIG_KSU=y did not survive olddefconfig."
+                exit 1
+              }
             fi
-          done
 
-      - name: Audit Qualcomm charger API
-        working-directory: kernel
+            make -j"$(nproc --all)" O="$outdir"
+            test -s "$outdir/arch/arm64/boot/Image"
+            cp "$outdir/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/$variant"
+
+            if [[ "${{ inputs.build_modules }}" == "true" ]]; then
+              make -j"$(nproc --all)" O="$outdir" modules
+              stage="$GITHUB_WORKSPACE/modules-$variant"
+              mkdir -p "$stage"
+              make O="$outdir" INSTALL_MOD_PATH="$stage" modules_install
+              find "$stage" -type f -name '*.ko' -print > "$GITHUB_WORKSPACE/$variant-modules.txt"
+              tar -czf "$GITHUB_WORKSPACE/$variant-modules.tar.gz" -C "$stage" .
+            fi
+
+            cp "$outdir/.config" "$GITHUB_WORKSPACE/$variant.config"
+          }
+
+          build_variant Image-KSU out-ksu yes
+          build_variant Image-NoKSU out-noksu no
+
+      - name: Replace only the two expected kernel images in original ZIP
+        shell: bash
         run: |
           set -euo pipefail
+          test -s Image-KSU
+          test -s Image-NoKSU
+          ksu_target="$(find original-payload -type f -name 'Image-KSU' -print -quit)"
+          noksu_target="$(find original-payload -type f -name 'Image-NoKSU' -print -quit)"
+          test -n "$ksu_target"
+          test -n "$noksu_target"
 
-          SRC="drivers/power/supply/qcom/schgm-flash.c"
-          LIB="drivers/power/supply/qcom/smb5-lib.h"
+          cp Image-KSU "$ksu_target"
+          cp Image-NoKSU "$noksu_target"
+          cmp -s Image-KSU "$ksu_target"
+          cmp -s Image-NoKSU "$noksu_target"
 
-          if [ ! -f "$SRC" ]; then
-            echo "Charger source not present: $SRC"
-            echo "Skipping optional charger audit."
-            exit 0
-          fi
+          # Confirm the original installer and all non-kernel payload files
+          # are unchanged relative to the extracted original ZIP.
+          installer="$(cat installer-path.txt)"
+          sha256sum "$installer" > installer-after.sha256
 
-          git grep -n -E \
-            'struct smb_charger|struct smb_irq_data|smblib_read[[:space:]]*\(|smblib_write[[:space:]]*\(|smblib_masked_write[[:space:]]*\(' \
-            -- drivers/power/supply/qcom \
-            > ../charger-api-audit.txt || true
+          # Compare device DTB/DTBO payloads to the original ZIP extraction.
+          # The workflow never rebuilds or replaces them.
+          find original-payload -type f \( -iname 'dtbo.img' -o -iname 'dtb.img' -o -iname '*dtbo*.img' \) -print -exec sha256sum {} \; | tee dtb-dtbo-preserved.txt
 
-          cat ../charger-api-audit.txt || true
+          rm -f "$ZIP_NAME"
+          (cd original-payload && zip -qr "$GITHUB_WORKSPACE/$ZIP_NAME" .)
+          unzip -t "$ZIP_NAME"
+          unzip -l "$ZIP_NAME" | grep -E 'Image-KSU|Image-NoKSU|dtbo|dtb.img'
+          test -s "$ZIP_NAME"
 
-          if [ -f "$LIB" ]; then
-            echo "Found smb5-lib.h; no automatic source modification."
-          else
-            echo "smb5-lib.h not found at the expected path."
-          fi
-
-      - name: Build kernel image, DTBs and modules
-        working-directory: kernel
-        timeout-minutes: 180
-        run: |
-          set -Eeuo pipefail
-
-          export PATH="/usr/lib/llvm-14/bin:$PATH"
-          export LD=ld.lld-14
-
-          echo "Starting Singularity kernel build"
-          echo "Device: $DEVICE"
-          echo "Branch: $KERNEL_BRANCH"
-          echo "Parallel jobs: 2"
-
-          free -h
-          df -h .
-
-          make -j2 \
-            O="$KERNEL_OUT" \
-            ARCH=arm64 \
-            LLVM=-14 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            Image.gz dtbs modules \
-            2>&1 | tee ../kernel-build.log
-
-      - name: Install compiled modules into staging
-        if: success()
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$MODULE_STAGING"
-
-          make -j2 \
-            O="$KERNEL_OUT" \
-            ARCH=arm64 \
-            LLVM=-14 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            INSTALL_MOD_PATH="$MODULE_STAGING" \
-            modules_install
-
-          find "$MODULE_STAGING" -type f -name '*.ko' \
-            -print | tee ../module-list.txt
-
-      - name: Collect build artifacts and diagnostics
-        if: always()
-        run: |
-          set -euo pipefail
-
-          mkdir -p artifacts
-
-          for file in \
-            kernel-build.log \
-            kernel-config.txt \
-            charger-api-audit.txt \
-            susfs-audit.txt \
-            module-list.txt
-          do
-            if [ -f "$file" ]; then
-              cp "$file" artifacts/
-            fi
-          done
-
-          if [ -d kernel-out ]; then
-            cp kernel-out/.config artifacts/kernel.config \
-              2>/dev/null || true
-
-            for image in \
-              kernel-out/arch/arm64/boot/Image \
-              kernel-out/arch/arm64/boot/Image.gz \
-              kernel-out/arch/arm64/boot/Image.gz-dtb
-            do
-              if [ -f "$image" ]; then
-                mkdir -p artifacts/boot
-                cp "$image" artifacts/boot/
-              fi
-            done
-
-            if [ -d kernel-out/arch/arm64/boot/dts ]; then
-              tar -czf artifacts/device-trees.tar.gz \
-                -C kernel-out/arch/arm64/boot dts
-            fi
-          fi
-
-          if [ -d module-staging ]; then
-            tar -czf artifacts/loadable-modules.tar.gz \
-              -C module-staging .
-          fi
-
-          if [ -d kernel/.git ]; then
-            git -C kernel rev-parse HEAD \
-              > artifacts/kernel-commit.txt
-          fi
-
-          {
-            echo "Branch: $KERNEL_BRANCH"
-            echo "Device: $DEVICE"
-            echo "LKM support requested: CONFIG_MODULES=y"
-            echo "SUSFS: audit only, no automatic patching"
-            echo "Build parallelism: 2 jobs"
-            echo "Flashable ZIP: not generated"
-            echo "Partition writes: none"
-          } > artifacts/build-summary.txt
-
-      - name: Upload build artifacts
-        if: always()
+      - name: Upload flashable ZIP and kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: singularity-instantnoodlep-${{ github.run_number }}
-          path: artifacts/
+          name: Singularity-instantnoodlep-build-${{ github.run_number }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            Image-KSU
+            Image-NoKSU
+            Image-KSU.config
+            Image-NoKSU.config
+            modules-Image-KSU.tar.gz
+            modules-Image-NoKSU.tar.gz
+            Image-KSU-modules.txt
+            Image-NoKSU-modules.txt
+            original-zip.sha256
+            original-payload-files.txt
+            dtb-dtbo-preserved.txt
           if-no-files-found: warn
           retention-days: 14
