@@ -37,12 +37,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ca-certificates \
-            clang-14 lld-14 llvm-14 \
+            clang-14 lld-14 llvm-14 lld \
             flex git libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             make pahole perl python3 python3-pip \
             rsync tar xz-utils zstd \
             device-tree-compiler cpio
+
+          command -v clang-14
+          command -v ld.lld-14
+          command -v ld.lld
 
       - name: Clone Singularity and initialize submodules
         run: |
@@ -77,8 +81,6 @@ jobs:
           KSU_ROOT="KernelSU-Next"
           KSU_KERNEL="$KSU_ROOT/kernel"
 
-          echo "=== KernelSU-Next source ==="
-
           if [ ! -d "$KSU_ROOT" ]; then
             echo "::error::KernelSU-Next submodule directory is missing."
             git submodule status
@@ -95,23 +97,19 @@ jobs:
 
           echo "KernelSU source found at $KSU_KERNEL"
 
-          echo "=== Driver integration ==="
-
           if [ ! -e drivers/kernelsu ]; then
             ln -s ../KernelSU-Next/kernel drivers/kernelsu
-            echo "Created drivers/kernelsu symlink."
           elif [ -L drivers/kernelsu ]; then
-            echo "Existing drivers/kernelsu symlink:"
-            readlink drivers/kernelsu
+            echo "Existing KernelSU symlink: $(readlink drivers/kernelsu)"
           elif [ -d drivers/kernelsu ]; then
             echo "Existing drivers/kernelsu directory preserved."
           else
-            echo "::error::drivers/kernelsu exists but is not a directory."
+            echo "::error::Invalid drivers/kernelsu path."
             exit 1
           fi
 
           if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::drivers/kernelsu/Kconfig is unavailable."
+            echo "::error::KernelSU Kconfig not found."
             exit 1
           fi
 
@@ -132,23 +130,16 @@ jobs:
           if entry not in text:
               marker = "\nendmenu"
               index = text.rfind(marker)
-
               if index < 0:
                   raise SystemExit(
-                      "Cannot safely add KernelSU Kconfig entry: "
-                      "no endmenu marker was found."
+                      "Cannot safely add KernelSU Kconfig entry."
                   )
-
-              text = (
-                  text[:index]
-                  + "\n" + entry + "\n"
-                  + text[index:]
-              )
+              text = text[:index] + "\n" + entry + "\n" + text[index:]
               path.write_text(text)
           PY
           fi
 
-          echo "=== KernelSU integration verified ==="
+          echo "=== KernelSU integration ==="
           grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
 
       - name: Audit existing SUSFS integration
@@ -156,30 +147,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "=== Existing SUSFS files ==="
-
-          for path in \
-            fs/susfs.c \
-            include/linux/susfs.h \
-            include/linux/susfs_def.h \
-            drivers/kernelsu
-          do
-            if [ -e "$path" ]; then
-              echo "Found: $path"
-            fi
-          done
-
-          echo "=== SUSFS symbols ==="
-
           git grep -n -i -E \
             'CONFIG_.*SUSFS|susfs' \
-            -- '*Kconfig*' '*Makefile*' \
-               fs include/linux drivers \
+            -- '*Kconfig*' '*Makefile*' fs include/linux drivers \
             > ../susfs-audit.txt || true
 
           cat ../susfs-audit.txt || true
-
-          echo "Audit only. No SUSFS patches will be reapplied."
+          echo "No SUSFS patches will be reapplied."
 
       - name: Locate kernel defconfig
         id: config
@@ -224,6 +198,9 @@ jobs:
 
           mkdir -p "$KERNEL_OUT"
 
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export LD=ld.lld-14
+
           make O="$KERNEL_OUT" \
             ARCH=arm64 LLVM=-14 \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -234,7 +211,6 @@ jobs:
             --enable KPROBES \
             --enable KALLSYMS \
             --enable KALLSYMS_ALL \
-            --enable EXT4_FS \
             --enable KSU
 
           make O="$KERNEL_OUT" \
@@ -244,17 +220,14 @@ jobs:
 
           cp "$KERNEL_OUT/.config" ../kernel-config.txt
 
-          echo "=== Required configuration ==="
-
           grep -E \
-            '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_EXT4_FS|CONFIG_KSU|CONFIG_KALLSYMS)=' \
+            '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_KSU|CONFIG_KALLSYMS)=' \
             "$KERNEL_OUT/.config" || true
 
           for option in MODULES KPROBES KSU; do
             if ! grep -qx "CONFIG_${option}=y" \
                 "$KERNEL_OUT/.config"; then
               echo "::error::CONFIG_${option}=y is unavailable."
-              echo "Check Kconfig dependencies and integration."
               exit 1
             fi
           done
@@ -272,11 +245,6 @@ jobs:
             exit 1
           fi
 
-          echo "=== Charger source includes ==="
-          sed -n '1,140p' "$SRC"
-
-          echo "=== Definitions and declarations ==="
-
           git grep -n -E \
             'struct smb_charger|struct smb_irq_data|smblib_read[[:space:]]*\(|smblib_write[[:space:]]*\(|smblib_masked_write[[:space:]]*\(' \
             -- drivers/power/supply/qcom \
@@ -284,13 +252,8 @@ jobs:
 
           cat ../charger-api-audit.txt || true
 
-          if [ ! -f "$LIB" ]; then
-            echo "::warning::smb5-lib.h not found at expected path."
-            echo "The API audit has been saved."
-            exit 0
-          fi
-
-          python3 - <<'PY'
+          if [ -f "$LIB" ]; then
+            python3 - <<'PY'
           from pathlib import Path
 
           source = Path("drivers/power/supply/qcom/schgm-flash.c")
@@ -300,37 +263,31 @@ jobs:
           target = '#include "schgm-flash.h"'
 
           if wanted not in text and target in text:
-              text = text.replace(
-                  target,
-                  wanted + "\n" + target,
-                  1
-              )
+              text = text.replace(target, wanted + "\n" + target, 1)
               source.write_text(text)
               print("Added smb5-lib.h before schgm-flash.h.")
           else:
               print("No include-order change required.")
           PY
-
-          echo "=== Updated includes ==="
-          sed -n '1,100p' "$SRC"
+          else
+            echo "::warning::smb5-lib.h not found at expected path."
+          fi
 
       - name: Build kernel image, DTBs and modules
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          THREADS="$(nproc)"
-          echo "Building with $THREADS jobs."
+          export PATH="/usr/lib/llvm-14/bin:$PATH"
+          export LD=ld.lld-14
 
-          make -j"$THREADS" \
+          make -j"$(nproc)" \
             O="$KERNEL_OUT" \
             ARCH=arm64 \
             LLVM=-14 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             Image.gz dtbs modules \
             2>&1 | tee ../kernel-build.log
-
-          echo "Kernel compilation completed."
 
       - name: Install compiled modules into staging
         if: success()
@@ -387,10 +344,6 @@ jobs:
               tar -czf artifacts/device-trees.tar.gz \
                 -C kernel-out/arch/arm64/boot dts
             fi
-
-            find kernel-out -type f -name '*.ko' \
-              -exec cp --parents '{}' artifacts/ \; \
-              2>/dev/null || true
           fi
 
           if [ -d module-staging ]; then
@@ -399,18 +352,18 @@ jobs:
           fi
 
           if [ -d kernel/.git ]; then
-            echo "Kernel commit: $(git -C kernel rev-parse HEAD)" \
-              > artifacts/build-summary.txt
+            git -C kernel rev-parse HEAD \
+              > artifacts/kernel-commit.txt
           fi
 
           {
             echo "Branch: $KERNEL_BRANCH"
-            echo "Device target: $DEVICE"
+            echo "Device: $DEVICE"
             echo "LKM support requested: CONFIG_MODULES=y"
             echo "SUSFS: no automatic patching"
             echo "Flashable ZIP: not generated"
             echo "Partition writes: none"
-          } >> artifacts/build-summary.txt
+          } > artifacts/build-summary.txt
 
       - name: Upload build artifacts
         if: always()
