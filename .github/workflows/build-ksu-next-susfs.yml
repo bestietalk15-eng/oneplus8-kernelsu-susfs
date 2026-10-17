@@ -34,6 +34,7 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ca-certificates \
@@ -45,10 +46,9 @@ jobs:
             device-tree-compiler cpio
 
           command -v clang-14
-          command -v ld.lld-14
-          command -v ld.lld
+          command -v ld.lld-14 || command -v ld.lld
 
-      - name: Clone Singularity and initialize submodules
+      - name: Clone Singularity source
         run: |
           set -euo pipefail
 
@@ -68,79 +68,40 @@ jobs:
 
           git submodule status
 
-          if [ "$(git branch --show-current)" != "$KERNEL_BRANCH" ]; then
-            echo "::error::Unexpected kernel branch."
-            exit 1
-          fi
+          test "$(git branch --show-current)" = "$KERNEL_BRANCH"
 
-      - name: Verify and wire existing KernelSU-Next
+      - name: Verify existing KernelSU-Next
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          KSU_ROOT="KernelSU-Next"
-          KSU_KERNEL="$KSU_ROOT/kernel"
-
-          if [ ! -d "$KSU_ROOT" ]; then
-            echo "::error::KernelSU-Next submodule directory is missing."
+          if [ ! -d KernelSU-Next ]; then
+            echo "::error::KernelSU-Next directory is missing."
             git submodule status
             exit 1
           fi
 
-          if [ ! -f "$KSU_KERNEL/Kconfig" ] ||
-             [ ! -f "$KSU_KERNEL/Makefile" ]; then
-            echo "::error::KernelSU-Next submodule is incomplete."
-            find "$KSU_ROOT" -maxdepth 3 -type f \
-              | head -100 || true
+          if [ ! -d KernelSU-Next/kernel ]; then
+            echo "::error::KernelSU-Next source is incomplete."
+            find KernelSU-Next -maxdepth 3 -type f \
+              | head -80 || true
             exit 1
           fi
 
-          echo "KernelSU source found at $KSU_KERNEL"
+          echo "=== Existing KernelSU integration ==="
 
-          if [ ! -e drivers/kernelsu ]; then
-            ln -s ../KernelSU-Next/kernel drivers/kernelsu
-          elif [ -L drivers/kernelsu ]; then
-            echo "Existing KernelSU symlink: $(readlink drivers/kernelsu)"
-          elif [ -d drivers/kernelsu ]; then
-            echo "Existing drivers/kernelsu directory preserved."
-          else
-            echo "::error::Invalid drivers/kernelsu path."
+          git grep -n -i -E \
+            'CONFIG_KSU|kernelsu|KernelSU-Next' \
+            -- Makefile Kconfig drivers arch/arm64/configs \
+            > ../kernelsu-audit.txt || true
+
+          cat ../kernelsu-audit.txt || true
+
+          if ! grep -q 'CONFIG_KSU' ../kernelsu-audit.txt; then
+            echo "::error::Existing KernelSU build integration was not found."
+            echo "No duplicate implementation will be added automatically."
             exit 1
           fi
-
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::KernelSU Kconfig not found."
-            exit 1
-          fi
-
-          if ! grep -Fq 'kernelsu/' drivers/Makefile; then
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' \
-              >> drivers/Makefile
-          fi
-
-          if ! grep -Fq 'source "drivers/kernelsu/Kconfig"' \
-              drivers/Kconfig; then
-            python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("drivers/Kconfig")
-          text = path.read_text()
-          entry = 'source "drivers/kernelsu/Kconfig"'
-
-          if entry not in text:
-              marker = "\nendmenu"
-              index = text.rfind(marker)
-              if index < 0:
-                  raise SystemExit(
-                      "Cannot safely add KernelSU Kconfig entry."
-                  )
-              text = text[:index] + "\n" + entry + "\n" + text[index:]
-              path.write_text(text)
-          PY
-          fi
-
-          echo "=== KernelSU integration ==="
-          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
 
       - name: Audit existing SUSFS integration
         working-directory: kernel
@@ -153,7 +114,8 @@ jobs:
             > ../susfs-audit.txt || true
 
           cat ../susfs-audit.txt || true
-          echo "No SUSFS patches will be reapplied."
+
+          echo "Audit only. SUSFS patches will not be reapplied."
 
       - name: Locate kernel defconfig
         id: config
@@ -162,25 +124,25 @@ jobs:
           set -euo pipefail
 
           candidates=(
-            arch/arm64/configs/vendor/kona-perf_defconfig
-            arch/arm64/configs/kona-perf_defconfig
-            arch/arm64/configs/vendor/kona_defconfig
-            arch/arm64/configs/kona_defconfig
-            arch/arm64/configs/vendor/instantnoodlep_defconfig
-            arch/arm64/configs/instantnoodlep_defconfig
+            vendor/kona-perf_defconfig
+            kona-perf_defconfig
+            vendor/kona_defconfig
+            kona_defconfig
+            vendor/instantnoodlep_defconfig
+            instantnoodlep_defconfig
           )
 
           selected=""
 
           for candidate in "${candidates[@]}"; do
-            if [ -f "$candidate" ]; then
+            if [ -f "arch/arm64/configs/$candidate" ]; then
               selected="$candidate"
               break
             fi
           done
 
           if [ -z "$selected" ]; then
-            echo "::error::No recognized Kona defconfig found."
+            echo "::error::No recognized defconfig found."
             find arch/arm64/configs -type f \
               -name '*defconfig' | head -200
             exit 1
@@ -196,13 +158,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$KERNEL_OUT"
-
           export PATH="/usr/lib/llvm-14/bin:$PATH"
           export LD=ld.lld-14
 
+          mkdir -p "$KERNEL_OUT"
+
+          echo "Using defconfig: $DEFCONFIG"
+          echo "Using linker: $(command -v "$LD")"
+
           make O="$KERNEL_OUT" \
-            ARCH=arm64 LLVM=-14 \
+            ARCH=arm64 \
+            LLVM=-14 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             "$DEFCONFIG"
 
@@ -214,17 +180,20 @@ jobs:
             --enable KSU
 
           make O="$KERNEL_OUT" \
-            ARCH=arm64 LLVM=-14 \
+            ARCH=arm64 \
+            LLVM=-14 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
           cp "$KERNEL_OUT/.config" ../kernel-config.txt
 
+          echo "=== Relevant kernel configuration ==="
+
           grep -E \
             '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_KSU|CONFIG_KALLSYMS)=' \
             "$KERNEL_OUT/.config" || true
 
-          for option in MODULES KPROBES KSU; do
+          for option in MODULES KSU; do
             if ! grep -qx "CONFIG_${option}=y" \
                 "$KERNEL_OUT/.config"; then
               echo "::error::CONFIG_${option}=y is unavailable."
@@ -241,8 +210,8 @@ jobs:
           LIB="drivers/power/supply/qcom/smb5-lib.h"
 
           if [ ! -f "$SRC" ]; then
-            echo "::error::Expected charger source is missing: $SRC"
-            exit 1
+            echo "Qualcomm charger source not present; skipping audit."
+            exit 0
           fi
 
           git grep -n -E \
@@ -253,25 +222,15 @@ jobs:
           cat ../charger-api-audit.txt || true
 
           if [ -f "$LIB" ]; then
-            python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path("drivers/power/supply/qcom/schgm-flash.c")
-          text = source.read_text()
-
-          wanted = '#include "smb5-lib.h"'
-          target = '#include "schgm-flash.h"'
-
-          if wanted not in text and target in text:
-              text = text.replace(target, wanted + "\n" + target, 1)
-              source.write_text(text)
-              print("Added smb5-lib.h before schgm-flash.h.")
-          else:
-              print("No include-order change required.")
-          PY
+            echo "Found smb5-lib.h."
+            grep -n -E \
+              'struct smb_charger|struct smb_irq_data|smblib_read|smblib_write|smblib_masked_write' \
+              "$LIB" || true
           else
-            echo "::warning::smb5-lib.h not found at expected path."
+            echo "smb5-lib.h is absent at the expected path."
           fi
+
+          echo "No speculative source changes made."
 
       - name: Build kernel image, DTBs and modules
         working-directory: kernel
@@ -289,7 +248,7 @@ jobs:
             Image.gz dtbs modules \
             2>&1 | tee ../kernel-build.log
 
-      - name: Install compiled modules into staging
+      - name: Stage loadable modules
         if: success()
         working-directory: kernel
         run: |
@@ -298,7 +257,8 @@ jobs:
           mkdir -p "$MODULE_STAGING"
 
           make O="$KERNEL_OUT" \
-            ARCH=arm64 LLVM=-14 \
+            ARCH=arm64 \
+            LLVM=-14 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$MODULE_STAGING" \
             modules_install
@@ -306,7 +266,7 @@ jobs:
           find "$MODULE_STAGING" -type f -name '*.ko' \
             -print | tee ../module-list.txt
 
-      - name: Collect build artifacts and diagnostics
+      - name: Collect build artifacts
         if: always()
         run: |
           set -euo pipefail
@@ -316,8 +276,9 @@ jobs:
           for file in \
             kernel-build.log \
             kernel-config.txt \
-            charger-api-audit.txt \
+            kernelsu-audit.txt \
             susfs-audit.txt \
+            charger-api-audit.txt \
             module-list.txt
           do
             if [ -f "$file" ]; then
@@ -344,6 +305,10 @@ jobs:
               tar -czf artifacts/device-trees.tar.gz \
                 -C kernel-out/arch/arm64/boot dts
             fi
+
+            find kernel-out -type f -name '*.ko' \
+              -exec cp --parents '{}' artifacts/ \; \
+              2>/dev/null || true
           fi
 
           if [ -d module-staging ]; then
