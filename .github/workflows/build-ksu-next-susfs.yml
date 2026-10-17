@@ -1,502 +1,509 @@
 
-name: Singularity Event Horizon - OnePlus 8 Pro Validation
+name: Build Singularity Kernel with KernelSU-Next and SUSFS
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/singularity-event-horizon.yml"
+    inputs:
+      build_modules:
+        description: "Build and archive loadable kernel modules"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
-concurrency:
-  group: singularity-event-horizon-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
+  KERNEL_BRANCH: event-horizon
+  SUSFS_SOURCE: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: kernel-4.19
+  DEVICE_CODENAME: instantnoodlep
+  KERNEL_OUT: kernel-out
 
 jobs:
   build:
-    name: Build and Validate Kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
-    env:
-      KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
-      KERNEL_BRANCH: event-horizon
-      DEVICE: instantnoodlep
-      ARCH: arm64
-      SUBARCH: arm64
-      LLVM: "1"
-      OUT: ${{ github.workspace }}/kernel-out
-
     steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
       - name: Install build dependencies
         shell: bash
         run: |
           set -euxo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            ccache \
-            clang \
-            cmake \
-            curl \
-            flex \
-            git \
-            libelf-dev \
-            libncurses-dev \
-            lld \
-            llvm \
-            make \
-            pahole \
-            python3 \
-            python3-pip \
-            rsync \
-            unzip \
-            zip \
-            zlib1g-dev
+            bc bison build-essential cpio curl flex git \
+            libelf-dev libssl-dev lz4 make python3 \
+            python-is-python3 rsync zip unzip dwarves patch \
+            clang llvm lld gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
 
-      - name: Checkout exact Singularity branch
+      - name: Clone exact kernel source and branch
         shell: bash
         run: |
           set -euxo pipefail
 
-          git clone \
+          git clone --recurse-submodules --single-branch \
             --branch "$KERNEL_BRANCH" \
-            --recurse-submodules \
-            "$KERNEL_SOURCE" \
-            kernel
+            "$KERNEL_SOURCE" kernel
 
-          cd kernel
+          test -s kernel/Makefile
 
-          git checkout "$KERNEL_BRANCH"
-          git submodule update --init --recursive
+          test "$(git -C kernel branch --show-current)" \
+            = "$KERNEL_BRANCH"
 
-          echo "===== Source repository ====="
-          git remote -v
+          {
+            echo "Kernel source: $KERNEL_SOURCE"
+            echo "Kernel branch: $(git -C kernel branch --show-current)"
+            echo "Kernel commit: $(git -C kernel rev-parse HEAD)"
+            echo "Submodule status:"
+            git -C kernel submodule status --recursive || true
+          } | tee "$GITHUB_WORKSPACE/source-info.txt"
 
-          echo "===== Source branch ====="
-          git branch --show-current
-
-          echo "===== Source commit ====="
-          git rev-parse HEAD
-
-          echo "===== Submodule revisions ====="
-          git submodule status --recursive
-
-          test "$(git branch --show-current)" = "$KERNEL_BRANCH"
-          test -f Makefile
-
-      - name: Verify KernelSU-Next checkout
-        shell: bash
+      - name: Verify existing KernelSU-Next integration
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [ -d KernelSU-Next ]; then
-            echo "KernelSU-Next directory found."
-
-            git -C KernelSU-Next rev-parse HEAD 2>/dev/null || true
-            git -C KernelSU-Next status --short 2>/dev/null || true
-
-            find KernelSU-Next -maxdepth 2 -type f \
-              \( -name Kconfig -o -name Makefile \) \
-              -print | head -80 || true
+          if [ -L drivers/kernelsu ]; then
+            test -e drivers/kernelsu
+            KSU_DIR="$(readlink -f drivers/kernelsu)"
+          elif [ -d drivers/kernelsu ]; then
+            KSU_DIR="drivers/kernelsu"
           else
-            echo "::warning::KernelSU-Next directory not found."
+            echo "::error::Existing drivers/kernelsu integration not found."
+            echo "Refusing to clone or install a different KernelSU tree."
+            exit 1
           fi
 
-      - name: Audit device and defconfig support
+          test -s "$KSU_DIR/Kconfig"
+          test -s "$KSU_DIR/Makefile"
+
+          echo "KernelSU directory: $KSU_DIR"
+
+          find "$KSU_DIR" -maxdepth 3 -type f \
+            \( -iname '*susfs*' -o -name Kconfig \) \
+            -print | head -100
+
+      - name: Fetch SUSFS kernel-4.19 patches
         shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone --depth=1 --single-branch \
+            --branch "$SUSFS_BRANCH" \
+            "$SUSFS_SOURCE" susfs4ksu
+
+          test -s \
+            susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+
+          test -s \
+            susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+
+          test -s susfs4ksu/kernel_patches/fs/susfs.c
+          test -s susfs4ksu/kernel_patches/include/linux/susfs.h
+
+      - name: Apply SUSFS kernel patch safely
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "===== Device references ====="
+          PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
 
-          git grep -niE \
-            'instantnoodlep|OnePlus 8 Pro|OnePlus8Pro' \
-            HEAD -- \
-            'arch/arm64/*' \
-            '*/kona*' \
-            '*/instantnoodlep*' \
-            2>/dev/null || true
+          mkdir -p "$DIAG"
 
-          echo "===== Available Kona defconfigs ====="
+          {
+            echo "Kernel commit: $(git rev-parse HEAD)"
+            echo "Kernel branch: $(git branch --show-current)"
+            echo "SUSFS branch: $SUSFS_BRANCH"
+            echo "Patch: $PATCH"
+          } | tee "$DIAG/diagnostics.txt"
 
-          find arch/arm64/configs -type f \
-            -iname '*kona*defconfig' -print | sort || true
+          if ! patch --batch --forward --dry-run -p1 \
+              < "$PATCH" > "$DIAG/kernel-patch-dry-run.log" 2>&1; then
 
-          echo "===== Device tree references ====="
+            cat "$DIAG/kernel-patch-dry-run.log"
 
-          find arch/arm64/boot/dts -type f \
-            \( -iname '*kona*' -o -iname '*instantnoodlep*' \) \
-            -print 2>/dev/null | head -200 || true
+            {
+              echo "SUSFS patch dry-run failed. No patch was applied."
 
-          echo "===== Compatibility note ====="
-          echo "A Kona defconfig alone does not establish OnePlus 8 Pro compatibility."
+              for f in \
+                fs/namespace.c \
+                fs/proc/task_mmu.c \
+                include/linux/mount.h \
+                include/linux/cred.h \
+                fs/internal.h; do
 
-      - name: Select an available Kona defconfig
+                if [ -f "$f" ]; then
+                  echo "===== $f ====="
+                  grep -n -E \
+                    'path_umount|get_cred_rcu|susfs|struct path|struct cred' \
+                    "$f" | head -100 || true
+                fi
+              done
+            } >> "$DIAG/diagnostics.txt"
+
+            echo "::error::SUSFS patch is incompatible with this source revision."
+            echo "Review the SUSFS-patch-diagnostics artifact."
+            exit 1
+          fi
+
+          patch --batch --forward -p1 < "$PATCH"
+
+          cp \
+            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/susfs.c" \
+            fs/susfs.c
+
+          install -m 0644 \
+            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/susfs.h" \
+            include/linux/susfs.h
+
+          grep -q 'susfs.o' fs/Makefile || {
+            echo "::error::fs/Makefile does not reference susfs.o."
+            exit 1
+          }
+
+          if find . -type f -name '*.rej' -print -quit | grep -q .; then
+            find . -type f -name '*.rej' -print
+            echo "::error::Rejected patch files remain."
+            exit 1
+          fi
+
+      - name: Apply SUSFS patch to existing KernelSU-Next
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KSU_PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+
+          if [ -L drivers/kernelsu ]; then
+            KSU_DIR="$(readlink -f drivers/kernelsu)"
+          else
+            KSU_DIR="$GITHUB_WORKSPACE/kernel/drivers/kernelsu"
+          fi
+
+          KSU_ROOT="$(
+            git -C "$KSU_DIR" rev-parse --show-toplevel 2>/dev/null \
+              || dirname "$KSU_DIR"
+          )"
+
+          mkdir -p "$GITHUB_WORKSPACE/susfs-diagnostics"
+
+          if patch --batch --forward --dry-run \
+              -d "$KSU_ROOT" -p1 \
+              < "$KSU_PATCH" \
+              > "$GITHUB_WORKSPACE/susfs-diagnostics/ksu-patch-dry-run.log" 2>&1; then
+
+            patch --batch --forward \
+              -d "$KSU_ROOT" -p1 < "$KSU_PATCH"
+          else
+            cat "$GITHUB_WORKSPACE/susfs-diagnostics/ksu-patch-dry-run.log"
+            echo "::error::SUSFS patch does not match this KernelSU-Next tree."
+            exit 1
+          fi
+
+      - name: Fix Qualcomm charger header dependency
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="drivers/power/supply/qcom/schgm-flash.c"
+          HDR="drivers/power/supply/qcom/schgm-flash.h"
+          LIB="drivers/power/supply/qcom/smb5-lib.h"
+          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
+
+          mkdir -p "$DIAG"
+
+          test -s "$SRC" || {
+            echo "::error::schgm-flash.c is missing."
+            exit 1
+          }
+
+          test -s "$HDR" || {
+            echo "::error::schgm-flash.h is missing."
+            exit 1
+          }
+
+          test -s "$LIB" || {
+            echo "::error::smb5-lib.h is missing."
+            exit 1
+          }
+
+          {
+            echo "Before fix: $SRC"
+            sed -n '1,45p' "$SRC"
+          } | tee "$DIAG/schgm-flash-header-fix.log"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          src = Path("drivers/power/supply/qcom/schgm-flash.c")
+          hdr = Path("drivers/power/supply/qcom/schgm-flash.h")
+          lib = Path("drivers/power/supply/qcom/smb5-lib.h")
+
+          source = src.read_text()
+          header = hdr.read_text()
+          library_header = lib.read_text()
+
+          # The implementation uses smb_charger, smb_irq_data,
+          # smblib_read() and smblib_write(). Include the API header
+          # before schgm-flash.h so the definitions are available.
+
+          if not re.search(
+              r'^\s*#\s*include\s*[<"]smb5-lib\.h[">]',
+              source,
+              re.M
+          ):
+              matches = list(re.finditer(
+                  r'^\s*#\s*include\s*[<"]schgm-flash\.h[">]\s*$',
+                  source,
+                  re.M
+              ))
+
+              if len(matches) != 1:
+                  raise SystemExit(
+                      'Expected exactly one schgm-flash.h include; '
+                      'refusing an ambiguous source edit.'
+                  )
+
+              match = matches[0]
+              source = (
+                  source[:match.start()]
+                  + '#include "smb5-lib.h"\n'
+                  + source[match.start():]
+              )
+              src.write_text(source)
+
+          # Keep the public header safe to include independently.
+          if not re.search(
+              r'^\s*struct\s+smb_charger\s*;',
+              header,
+              re.M
+          ):
+              guard = re.search(
+                  r'^\s*#\s*define\s+\w+',
+                  header,
+                  re.M
+              )
+
+              if not guard:
+                  raise SystemExit(
+                      'Could not identify schgm-flash.h include guard.'
+                  )
+
+              pos = guard.end()
+              header = (
+                  header[:pos]
+                  + '\n\nstruct smb_charger;\n'
+                  + header[pos:]
+              )
+              hdr.write_text(header)
+
+          # Fail rather than silently continue if the expected API
+          # declarations are absent from this kernel's own header.
+          required = [
+              "struct smb_charger",
+              "struct smb_irq_data",
+              "smblib_read",
+              "smblib_write",
+          ]
+
+          missing = [
+              symbol for symbol in required
+              if symbol not in library_header
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "smb5-lib.h lacks expected symbols: "
+                  + ", ".join(missing)
+              )
+
+          print("Verified smb5-lib.h and applied guarded header fix.")
+          PY
+
+          grep -n 'smb5-lib.h' "$SRC"
+          grep -n 'struct smb_charger;' "$HDR"
+
+          {
+            echo "After fix: $SRC"
+            sed -n '1,45p' "$SRC"
+          } | tee -a "$DIAG/schgm-flash-header-fix.log"
+
+      - name: Select and configure kernel defconfig
         id: config
-        shell: bash
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
 
-          CONFIG_DIR="arch/arm64/configs"
-          SELECTED=""
+          DEFCONFIG=""
 
           for candidate in \
-            "$CONFIG_DIR/vendor/kona-perf_defconfig" \
-            "$CONFIG_DIR/kona-perf_defconfig" \
-            "$CONFIG_DIR/vendor/kona_defconfig" \
-            "$CONFIG_DIR/kona_defconfig"
-          do
-            if [ -f "$candidate" ]; then
-              SELECTED="$candidate"
+            arch/arm64/configs/vendor/kona-perf_defconfig \
+            arch/arm64/configs/kona-perf_defconfig \
+            arch/arm64/configs/vendor/kona_defconfig \
+            arch/arm64/configs/kona_defconfig \
+            arch/arm64/configs/vendor/instantnoodlep_defconfig \
+            arch/arm64/configs/instantnoodlep_defconfig; do
+
+            if [ -s "$candidate" ]; then
+              DEFCONFIG="$candidate"
               break
             fi
           done
 
-          if [ -z "$SELECTED" ]; then
-            echo "::error::No expected Kona defconfig was found."
-            echo "Available candidates:"
-            find "$CONFIG_DIR" -type f \
-              -iname '*kona*defconfig' -print | sort || true
+          if [ -z "$DEFCONFIG" ]; then
+            echo "::error::No supported Kona/instantnoodle defconfig found."
+            find arch/arm64/configs -maxdepth 4 -type f \
+              \( -iname '*kona*' -o -iname '*instantnoodle*' \) \
+              -print | head -150
             exit 1
           fi
 
-          # make expects the defconfig name relative to arch/arm64/configs.
-          DEFCONFIG="${SELECTED#"$CONFIG_DIR"/}"
+          DEFCONFIG_NAME="${DEFCONFIG#arch/arm64/configs/}"
 
-          echo "Selected defconfig file: $SELECTED"
-          echo "Defconfig name for make: $DEFCONFIG"
+          echo "Selected defconfig: $DEFCONFIG"
+          echo "defconfig=$DEFCONFIG_NAME" >> "$GITHUB_OUTPUT"
 
-          test -f "$SELECTED"
+          mkdir -p "$KERNEL_OUT"
 
-          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+          make O="$KERNEL_OUT" ARCH=arm64 LLVM=1 "$DEFCONFIG_NAME"
 
-      - name: Configure kernel with loadable module support
-        shell: bash
+          scripts/config --file "$KERNEL_OUT/.config" \
+            -e MODULES \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
+            -e KPROBES \
+            -e KSU
+
+          make O="$KERNEL_OUT" ARCH=arm64 LLVM=1 olddefconfig
+
+          grep -q '^CONFIG_MODULES=y' "$KERNEL_OUT/.config" || {
+            echo "::error::CONFIG_MODULES=y is required for LKM support."
+            exit 1
+          }
+
+          grep -q '^CONFIG_KSU=y' "$KERNEL_OUT/.config" || {
+            echo "::error::CONFIG_KSU=y did not survive olddefconfig."
+            exit 1
+          }
+
+          {
+            echo "Defconfig: $DEFCONFIG"
+            echo "Kernel commit: $(git rev-parse HEAD)"
+            echo "Requested device codename: $DEVICE_CODENAME"
+            grep -E \
+              '^CONFIG_(MODULES|KSU|KPROBES|KSU_SUSFS)=' \
+              "$KERNEL_OUT/.config" || true
+          } | tee "$GITHUB_WORKSPACE/kernel-config-summary.txt"
+
+          cp "$KERNEL_OUT/.config" "$GITHUB_WORKSPACE/kernel.config"
+
+      - name: Build kernel image, device trees, and optional modules
         working-directory: kernel
         env:
           DEFCONFIG: ${{ steps.config.outputs.defconfig }}
-        run: |
-          set -euxo pipefail
-
-          test -n "$DEFCONFIG"
-
-          mkdir -p "$OUT"
-
-          echo "Using defconfig: $DEFCONFIG"
-
-          make \
-            O="$OUT" \
-            ARCH="$ARCH" \
-            SUBARCH="$SUBARCH" \
-            LLVM="$LLVM" \
-            "$DEFCONFIG"
-
-          test -f "$OUT/.config"
-
-          # Enable loadable kernel modules without forcing every driver
-          # to be modular or built-in.
-          scripts/config \
-            --file "$OUT/.config" \
-            --enable MODULES
-
-          make \
-            O="$OUT" \
-            ARCH="$ARCH" \
-            SUBARCH="$SUBARCH" \
-            LLVM="$LLVM" \
-            olddefconfig
-
-          echo "===== Resolved module configuration ====="
-
-          grep -E \
-            '^CONFIG_MODULES=|^# CONFIG_MODULES is not set' \
-            "$OUT/.config" || true
-
-          if ! grep -qx 'CONFIG_MODULES=y' "$OUT/.config"; then
-            echo "::error::CONFIG_MODULES=y did not survive olddefconfig."
-            exit 1
-          fi
-
-          cp "$OUT/.config" "$GITHUB_WORKSPACE/kernel-config.txt"
-
-          echo "LKM support is enabled."
-          echo "Drivers can be built in (=y) or as modules (=m), depending"
-          echo "on their individual resolved configuration."
-
-      - name: Check missing BPF JIT fallback
         shell: bash
-        working-directory: kernel
         run: |
           set -euo pipefail
 
-          HEADER="include/linux/filter.h"
-
-          if [ ! -f "$HEADER" ]; then
-            echo "::error::Missing $HEADER."
+          test -n "$DEFCONFIG" || {
+            echo "::error::DEFCONFIG output is empty."
             exit 1
-          fi
+          }
 
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-          import sys
+          echo "Building configured target: $DEFCONFIG"
 
-          path = Path("include/linux/filter.h")
-          text = path.read_text()
+          make -j"$(nproc --all)" \
+            O="$KERNEL_OUT" ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz dtbs
 
-          signature = (
-              r"static\s+inline\s+bool\s+"
-              r"bpf_jit_blinding_enabled\s*"
-              r"\(\s*struct\s+bpf_prog\s*\*\s*prog\s*\)"
-          )
-
-          marker = re.search(
-              r"^[ \t]*#\s*else\s*/\*\s*CONFIG_BPF_JIT\s*\*/[^\n]*",
-              text,
-              re.MULTILINE,
-          )
-
-          if not marker:
-              print(
-                  "::error::Cannot locate the exact CONFIG_BPF_JIT "
-                  "fallback section. No automatic patch applied."
-              )
-              sys.exit(1)
-
-          tail = text[marker.end():]
-
-          end_match = re.search(
-              r"^[ \t]*#\s*endif\b[^\n]*CONFIG_BPF_JIT[^\n]*",
-              tail,
-              re.MULTILINE,
-          )
-
-          if not end_match:
-              print(
-                  "::error::Cannot identify the end of the "
-                  "CONFIG_BPF_JIT conditional."
-              )
-              sys.exit(1)
-
-          section_end = marker.end() + end_match.start()
-          fallback_section = text[marker.end():section_end]
-
-          fallback_definitions = list(
-              re.finditer(signature, fallback_section)
-          )
-          all_definitions = list(re.finditer(signature, text))
-
-          if len(fallback_definitions) == 1:
-              print("BPF JIT fallback already exists.")
-              sys.exit(0)
-
-          if len(fallback_definitions) > 1:
-              print(
-                  "::error::Multiple fallback definitions detected."
-              )
-              sys.exit(1)
-
-          if len(all_definitions) != 1:
-              print(
-                  "::error::Unexpected helper definition count. "
-                  "Refusing to modify the source automatically."
-              )
-              sys.exit(1)
-
-          fallback = (
-              "\n"
-              "static inline bool bpf_jit_blinding_enabled"
-              "(struct bpf_prog *prog)\n"
-              "{\n"
-              "    return false;\n"
-              "}\n"
-              "\n"
-          )
-
-          updated = text[:section_end] + fallback + text[section_end:]
-          path.write_text(updated)
-
-          print("Added missing CONFIG_BPF_JIT fallback.")
-          PY
-
-          echo "===== BPF helper definitions ====="
-
-          grep -n -A5 -B3 \
-            'bpf_jit_blinding_enabled' "$HEADER" || true
-
-      - name: Audit KernelSU and SUSFS integration
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          echo "===== KernelSU references ====="
-
-          git grep -niE \
-            'KernelSU|kernelsu|ksu_init|CONFIG_KSU' \
-            HEAD -- \
-            Kconfig \
-            Makefile \
-            'init/*' \
-            'drivers/*' \
-            'fs/*' \
-            2>/dev/null | head -250 || true
-
-          echo "===== SUSFS references ====="
-
-          git grep -niE \
-            'susfs|CONFIG_KSU_SUSFS|ksu_susfs' \
-            HEAD -- \
-            Kconfig \
-            Makefile \
-            'fs/*' \
-            'include/*' \
-            'drivers/*' \
-            2>/dev/null | head -250 || true
-
-          echo "This audit does not prove full KernelSU or SUSFS integration."
-
-      - name: Build kernel image, device trees, and modules
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -uo pipefail
-
-          mkdir -p "$OUT"
-
-          set +e
-
-          make \
-            -j"$(nproc)" \
-            O="$OUT" \
-            ARCH="$ARCH" \
-            SUBARCH="$SUBARCH" \
-            LLVM="$LLVM" \
-            Image.gz dtbs modules \
-            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-
-          status=${PIPESTATUS[0]}
-
-          set -e
-
-          if [ "$status" -ne 0 ]; then
-            echo "::error::Kernel build failed with exit code $status."
-
-            echo "===== Relevant diagnostics ====="
-
-            grep -n -B5 -A8 -E \
-              'error:|fatal error:|undefined reference|Error [0-9]' \
-              "$GITHUB_WORKSPACE/build.log" | tail -250 || true
-
-            exit "$status"
-          fi
-
-      - name: Validate build artifacts
-        if: success()
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "===== Candidate boot images ====="
-
-          find "$OUT/arch/arm64/boot" -maxdepth 3 -type f \
-            \( -name Image -o -name Image.gz \
-               -o -name Image.gz-dtb -o -name '*.dtb' \
-               -o -name '*.dtbo' \) \
-            -print | sort || true
-
-          echo "===== Kernel modules ====="
-
-          find "$OUT" -type f -name '*.ko' -print | sort || true
-
-          if [ ! -s "$OUT/arch/arm64/boot/Image.gz" ] && \
-             [ ! -s "$OUT/arch/arm64/boot/Image" ]; then
-            echo "::error::No non-empty kernel image was produced."
+          test -s "$KERNEL_OUT/arch/arm64/boot/Image.gz" || {
+            echo "::error::Image.gz was not produced."
+            find "$KERNEL_OUT/arch/arm64/boot" \
+              -maxdepth 2 -type f -print || true
             exit 1
+          }
+
+          if [ "${{ inputs.build_modules }}" = "true" ]; then
+            make -j"$(nproc --all)" \
+              O="$KERNEL_OUT" ARCH=arm64 \
+              CC=clang LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              modules
+
+            mkdir -p "$GITHUB_WORKSPACE/module-staging"
+
+            make O="$KERNEL_OUT" ARCH=arm64 \
+              CC=clang LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              INSTALL_MOD_PATH="$GITHUB_WORKSPACE/module-staging" \
+              modules_install
+
+            find "$GITHUB_WORKSPACE/module-staging" \
+              -type f -name '*.ko' -print
           fi
 
-          if [ ! -s "$OUT/.config" ]; then
-            echo "::error::Final .config is missing."
-            exit 1
-          fi
-
-          grep -qx 'CONFIG_MODULES=y' "$OUT/.config"
-
-          echo "Artifact checks passed."
-          echo "Boot compatibility is not established by compilation alone."
-
-      - name: Collect diagnostic artifacts
+      - name: Collect build artifacts and diagnostics
         if: always()
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p artifacts
 
-          [ ! -f "$GITHUB_WORKSPACE/build.log" ] || \
-            cp "$GITHUB_WORKSPACE/build.log" \
-              "$GITHUB_WORKSPACE/diagnostics/"
+          cp -f source-info.txt artifacts/ 2>/dev/null || true
+          cp -f kernel-config-summary.txt artifacts/ 2>/dev/null || true
+          cp -f kernel.config artifacts/ 2>/dev/null || true
 
-          [ ! -f "$GITHUB_WORKSPACE/kernel-config.txt" ] || \
-            cp "$GITHUB_WORKSPACE/kernel-config.txt" \
-              "$GITHUB_WORKSPACE/diagnostics/"
-
-          if [ -d "$GITHUB_WORKSPACE/kernel" ]; then
-            (
-              cd "$GITHUB_WORKSPACE/kernel"
-              git rev-parse HEAD
-              git branch --show-current
-              git submodule status --recursive
-            ) > "$GITHUB_WORKSPACE/diagnostics/source-revisions.txt" 2>&1
-
-            if [ -f "$GITHUB_WORKSPACE/kernel/include/linux/filter.h" ]; then
-              grep -n -A5 -B3 \
-                'bpf_jit_blinding_enabled' \
-                "$GITHUB_WORKSPACE/kernel/include/linux/filter.h" \
-                > "$GITHUB_WORKSPACE/diagnostics/bpf-helper.txt" 2>&1
-            fi
+          if [ -s "kernel/$KERNEL_OUT/.config" ]; then
+            cp "kernel/$KERNEL_OUT/.config" \
+              artifacts/final-kernel.config
           fi
 
-          if [ -f "$OUT/.config" ]; then
-            cp "$OUT/.config" \
-              "$GITHUB_WORKSPACE/diagnostics/final-kernel.config"
+          if [ -s "kernel/$KERNEL_OUT/arch/arm64/boot/Image.gz" ]; then
+            cp "kernel/$KERNEL_OUT/arch/arm64/boot/Image.gz" artifacts/
+          fi
+
+          if [ -s "kernel/$KERNEL_OUT/arch/arm64/boot/Image" ]; then
+            cp "kernel/$KERNEL_OUT/arch/arm64/boot/Image" artifacts/
+          fi
+
+          if [ -d "kernel/$KERNEL_OUT/arch/arm64/boot/dts" ]; then
+            tar -czf artifacts/dtbs.tar.gz \
+              -C "kernel/$KERNEL_OUT/arch/arm64/boot" dts
+          fi
+
+          if [ -d module-staging ]; then
+            tar -czf artifacts/modules.tar.gz \
+              -C module-staging .
+          fi
+
+          if [ -d susfs-diagnostics ]; then
+            cp -a susfs-diagnostics artifacts/
           fi
 
       - name: Upload build artifacts and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: singularity-event-horizon-${{ github.run_number }}
-          path: |
-            kernel-out/arch/arm64/boot/Image
-            kernel-out/arch/arm64/boot/Image.gz
-            kernel-out/arch/arm64/boot/dts/**/*.dtb
-            kernel-out/arch/arm64/boot/dts/**/*.dtbo
-            kernel-out/.config
-            kernel-config.txt
-            build.log
-            diagnostics/
+          name: Singularity-event-horizon-build-${{ github.run_number }}
+          path: artifacts/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Report validation status
-        if: always()
-        shell: bash
-        run: |
-          echo "Source: $KERNEL_SOURCE"
-          echo "Branch: $KERNEL_BRANCH"
-          echo "Requested device: $DEVICE"
-          echo "LKM support: CONFIG_MODULES=y required"
-          echo "Flashable ZIP: not generated"
-          echo "Device boot compatibility: not yet established"
