@@ -1,276 +1,294 @@
-name: Build LOS24 Kernel with KernelSU-Next + SUSFS (Non-GKI)
+
+name: Singularity Event Horizon - OnePlus 8 Pro Validation
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_defconfig:
-        description: 'Kernel defconfig (must exist in arch/arm64/configs)'
-        required: true
-        default: 'vendor/kona-perf_defconfig'
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
-env:
-  KERNEL_SOURCE: https://github.com/oplus-kona/android_kernel_oneplus_sm8250.git
-  KERNEL_BRANCH: lineage-24.0
-  SUSFS_SOURCE: https://gitlab.com/simonpunk/susfs4ksu.git
-  SUSFS_BRANCH: kernel-4.19
-  DEVICE_CODENAME: instantnoodlep
-  ZIP_NAME: KSU-Next-SUSFS_OnePlus8Pro_instantnoodlep_LOS24.zip
+concurrency:
+  group: singularity-event-horizon-validation
+  cancel-in-progress: false
 
 jobs:
-  build:
+  validate-and-build:
+    name: Validate source, patches and kernel build
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
+      KERNEL_BRANCH: event-horizon
+      DEVICE: instantnoodlep
+      EXPECTED_ARCH: arm64
+      OUT: out
+
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
-
       - name: Install build dependencies
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential cpio curl flex git libelf-dev libssl-dev \
-            lz4 make python3 python-is-python3 rsync zip unzip dwarves
-
-      - name: Clone kernel source
-        run: |
-          set -euxo pipefail
-          git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
-          test -f kernel/Makefile
-          git -C kernel log -1 --oneline
-
-      - name: Download Clang toolchain
-        run: |
-          set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/toolchains/clang"
-          curl --fail --location --retry 3 \
-            'https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz' \
-            -o /tmp/clang.tar.gz
-          tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/toolchains/clang"
-          test -x "$GITHUB_WORKSPACE/toolchains/clang/bin/clang"
-          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> "$GITHUB_PATH"
-          "$GITHUB_WORKSPACE/toolchains/clang/bin/clang" --version
-
-      - name: Clone SUSFS patches
-        run: |
-          set -euxo pipefail
-          git clone --depth=1 --single-branch -b "$SUSFS_BRANCH" "$SUSFS_SOURCE" susfs4ksu
-          test -f susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
-          test -f susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-          test -f susfs4ksu/kernel_patches/fs/susfs.c
-          test -f susfs4ksu/kernel_patches/include/linux/susfs.h
-
-      - name: Integrate KernelSU-Next
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-          # The setup script expects drivers/kernelsu to be a symlink. If the
-          # kernel tree already has a real directory there, preserve it first;
-          # otherwise ln -sf can create a nested symlink instead of replacing it.
-          if [ -d drivers/kernelsu ] && [ ! -L drivers/kernelsu ]; then
-            backup="drivers/kernelsu.pre-ksun-${GITHUB_RUN_ID:-local}"
-            echo "Existing drivers/kernelsu directory found; preserving it at $backup"
-            mv drivers/kernelsu "$backup"
-          fi
-          curl --fail --location --retry 3 \
-            'https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh' \
-            -o /tmp/ksu-setup.sh
-          bash /tmp/ksu-setup.sh legacy
-          echo 'KernelSU-Next symlink details:'
-          ls -ld drivers/kernelsu
-          KSU_REAL_DIR="$(readlink -f drivers/kernelsu)"
-          echo "Resolved KernelSU-Next path: $KSU_REAL_DIR"
-          test -d "$KSU_REAL_DIR"
-          test -s "$KSU_REAL_DIR/Kconfig" || {
-            echo 'KernelSU-Next Kconfig was not found at the resolved symlink target.' >&2
-            find KernelSU-Next -maxdepth 3 -name Kconfig -print || true
-            exit 1
-          }
-
-      - name: Add SUSFS source and apply kernel patch
-        working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
-          SUSFS_PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-          test -s "$SUSFS_PATCH"
-          cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/susfs.c" fs/
-          cp "$GITHUB_WORKSPACE"/susfs4ksu/kernel_patches/include/linux/*.h include/linux/
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache clang \
+            flex git libelf-dev libssl-dev lld llvm \
+            python3 python-is-python3 rsync unzip zip \
+            zstd dwarves device-tree-compiler \
+            patch curl file perl
 
-          echo "Applying SUSFS patch to kernel commit: $(git rev-parse --short HEAD)"
-          # Capture patch output, then print it in either branch. This avoids
-          # losing the real patch exit code to a tee pipeline.
-          if patch --batch --forward -p1 < "$SUSFS_PATCH" > "$RUNNER_TEMP/susfs-patch.log" 2>&1; then
-            cat "$RUNNER_TEMP/susfs-patch.log"
-            echo "SUSFS kernel patch applied without rejected hunks."
-          else
-            patch_status=$?
-            echo "::error::SUSFS patch failed with status $patch_status. Full diagnostics follow."
-            echo "Patch source: $SUSFS_PATCH"
-            echo "Kernel commit: $(git rev-parse HEAD)"
-            echo "========== PATCH OUTPUT =========="
-            cat "$RUNNER_TEMP/susfs-patch.log"
-            echo "========== END PATCH OUTPUT =========="
+      - name: Checkout exact Singularity source
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            rej_count=0
-            # GNU patch normally writes one .rej file beside each source file.
-            # Check expected paths explicitly, then search everywhere as fallback.
-            for rej in fs/namespace.c.rej fs/proc/task_mmu.c.rej include/linux/mount.h.rej; do
-              if [ -f "$rej" ]; then
-                rej_count=$((rej_count + 1))
-                echo "========== REJECTED FILE: $rej =========="
-                cat "$rej"
-                echo "========== END REJECTED FILE: $rej =========="
-              fi
-            done
-            while IFS= read -r -d '' rej; do
-              case "$rej" in
-                fs/namespace.c.rej|fs/proc/task_mmu.c.rej|include/linux/mount.h.rej) continue ;;
-              esac
-              rej_count=$((rej_count + 1))
-              echo "========== REJECTED FILE: $rej =========="
-              cat "$rej"
-              echo "========== END REJECTED FILE: $rej =========="
-            done < <(find . -type f -name '*.rej' -print0)
+          git clone \
+            --branch "$KERNEL_BRANCH" \
+            --recurse-submodules \
+            "$KERNEL_SOURCE" kernel
 
-            if [ "$rej_count" -eq 0 ]; then
-              echo "::warning::No .rej files found. Printing patch reject metadata and exact target context."
-              find . -type f -name '*.rej' -print
-              for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h; do
-                if [ -f "$file" ]; then
-                  echo "========== CONTEXT: $file (numbered lines) =========="
-                  nl -ba "$file" | sed -n '1,220p'
-                  echo "========== END CONTEXT: $file =========="
-                fi
-              done
-            fi
-            exit "$patch_status"
-          fi
+          cd kernel
 
-          grep -q 'susfs.o' fs/Makefile || {
-            echo 'SUSFS patch did not add susfs.o to fs/Makefile; refusing to guess the correct insertion point.' >&2
+          git checkout "$KERNEL_BRANCH"
+          git submodule update --init --recursive
+
+          test "$(git branch --show-current)" = "$KERNEL_BRANCH"
+
+          git rev-parse HEAD | tee ../source-commit.txt
+          git status --short | tee ../source-status.txt
+          git submodule status | tee ../submodules.txt
+
+          grep -q 'KernelSU-Next' .gitmodules || {
+            echo "::error::Expected KernelSU-Next submodule is missing."
             exit 1
           }
 
-      - name: Apply SUSFS patch to KernelSU-Next
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-          KSU_REAL_DIR="$(readlink -f drivers/kernelsu)"
-          KSU_ROOT="$(dirname "$KSU_REAL_DIR")"
-          test -d "$KSU_ROOT/kernel"
-          cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "$KSU_ROOT/"
-          cd "$KSU_ROOT"
-          patch --batch --forward -p1 < 10_enable_susfs_for_ksu.patch
-          rm -f 10_enable_susfs_for_ksu.patch
-          grep -R -n 'KSU_SUSFS' kernel/Kconfig
-
-      - name: Configure kernel
-        working-directory: kernel
-        env:
-          KERNEL_DEFCONFIG: ${{ inputs.kernel_defconfig }}
-        run: |
-          set -euxo pipefail
-          test -f "arch/arm64/configs/$KERNEL_DEFCONFIG" || {
-            echo "Defconfig not found: arch/arm64/configs/$KERNEL_DEFCONFIG" >&2
-            find arch/arm64/configs -maxdepth 3 -type f -name '*kona*' -o -name '*instantnoodle*' | head -80
+          test -d KernelSU-Next
+          test -f KernelSU-Next/Makefile || {
+            echo "::error::KernelSU-Next checkout is incomplete."
             exit 1
           }
-          make O=out ARCH=arm64 "$KERNEL_DEFCONFIG"
-          scripts/config --file out/.config -e KSU
-          scripts/config --file out/.config -e KPROBES
-          scripts/config --file out/.config -e KPROBE_EVENTS
-          scripts/config --file out/.config -e KSU_KPROBE_HOOKS
-          scripts/config --file out/.config -e KSU_SUSFS
-          scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH
-          scripts/config --file out/.config -e KSU_SUSFS_SUS_MOUNT
-          scripts/config --file out/.config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-          scripts/config --file out/.config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-          scripts/config --file out/.config -e KSU_SUSFS_SUS_KSTAT
-          scripts/config --file out/.config -e KSU_SUSFS_TRY_UMOUNT
-          scripts/config --file out/.config -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_UNAME
-          scripts/config --file out/.config -e KSU_SUSFS_ENABLE_LOG
-          scripts/config --file out/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT
-          scripts/config --file out/.config -e KALLSYMS
-          scripts/config --file out/.config -e KALLSYMS_ALL
-          make O=out ARCH=arm64 olddefconfig
-          grep -E '^(CONFIG_(KSU|KPROBES|KPROBE_EVENTS|KSU_KPROBE_HOOKS|KSU_SUSFS))=' out/.config || true
-          grep -q '^CONFIG_KSU=y' out/.config
-          grep -q '^CONFIG_KPROBES=y' out/.config
-          grep -q '^CONFIG_KSU_SUSFS=y' out/.config
 
-      - name: Build kernel
+      - name: Inspect device support and kernel version
+        shell: bash
         working-directory: kernel
         run: |
-          set -euxo pipefail
-          make -j"$(nproc --all)" O=out ARCH=arm64 \
-            CC=clang LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          test -s out/arch/arm64/boot/Image
+          set -euo pipefail
 
-      - name: Package AnyKernel3 ZIP
+          mkdir -p ../artifacts
+
+          {
+            echo "Source: $KERNEL_SOURCE"
+            echo "Branch: $KERNEL_BRANCH"
+            echo "Device requested: OnePlus 8 Pro"
+            echo "Device codename: $DEVICE"
+            echo
+            echo "Kernel version:"
+            make kernelversion || true
+            echo
+            echo "Matching device and platform configurations:"
+            find arch/arm64/configs -type f \
+              \( -iname "*instantnoodlep*" \
+                 -o -iname "*instantnoodle*" \
+                 -o -iname "*kebab*" \
+                 -o -iname "*kona*defconfig" \) \
+              -print | sort
+            echo
+            echo "Device tree references:"
+            grep -Ril \
+              --exclude-dir=.git \
+              --include='*.dts' \
+              --include='*.dtsi' \
+              'instantnoodlep' arch/arm64/boot/dts \
+              2>/dev/null || true
+          } | tee ../artifacts/device-audit.txt
+
+          # Do not assume a shared SoC means shared device support.
+          if ! grep -Ril \
+            --exclude-dir=.git \
+            --include='*defconfig' \
+            'instantnoodlep' arch/arm64/configs \
+            > ../artifacts/device-defconfig-matches.txt; then
+            : > ../artifacts/device-defconfig-matches.txt
+          fi
+
+          if [ ! -s ../artifacts/device-defconfig-matches.txt ]; then
+            echo "::warning::No explicitly named instantnoodlep defconfig found."
+            echo "A verified device-specific configuration is required before packaging."
+          fi
+
+      - name: Verify existing KernelSU-Next integration
+        shell: bash
+        working-directory: kernel
         run: |
-          set -euxo pipefail
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          rm -rf AnyKernel3/.git
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          test -f AnyKernel3/anykernel.sh
-          # Set an explicit device check for the OnePlus 8 Pro codename.
-          # Replace existing device.name entries rather than relying on a grep
-          # that could match an unrelated comment or setting.
-          if grep -qE '^device.name[0-9]*=' AnyKernel3/anykernel.sh; then
-            sed -i -E '/^device.name[0-9]*=/d' AnyKernel3/anykernel.sh
+          set -euo pipefail
+
+          {
+            echo "KernelSU-Next submodule:"
+            git submodule status -- KernelSU-Next
+            echo
+            echo "KernelSU-related build references:"
+            grep -Rni \
+              --exclude-dir=.git \
+              --exclude='*.o' \
+              --exclude='*.a' \
+              -m 3 'KernelSU-Next' \
+              Makefile Kbuild Kconfig \
+              arch scripts security 2>/dev/null || true
+          } | tee ../artifacts/kernelsu-audit.txt
+
+          # Presence of a directory alone does not prove integration.
+          if ! grep -Rqs \
+            --exclude-dir=.git \
+            --exclude='*.o' \
+            --exclude='*.a' \
+            'KernelSU-Next' \
+            Makefile Kbuild Kconfig \
+            arch scripts security 2>/dev/null; then
+            echo "::error::Could not verify KernelSU-Next build integration."
+            exit 1
           fi
-          if grep -q '^do.devicecheck=' AnyKernel3/anykernel.sh; then
-            sed -i 's/^do.devicecheck=.*/do.devicecheck=1;/' AnyKernel3/anykernel.sh
+
+      - name: Verify SUSFS patch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          # Never claim SUSFS is integrated just because a patch
+          # repository or a directory exists.
+          {
+            echo "SUSFS integration audit"
+            echo "Kernel source: $KERNEL_SOURCE"
+            echo "Kernel branch: $KERNEL_BRANCH"
+            echo
+            echo "Checking for SUSFS implementation and patch references."
+
+            cd kernel
+
+            grep -Rni \
+              --exclude-dir=.git \
+              --exclude='*.o' \
+              --exclude='*.a' \
+              -m 5 'susfs' \
+              fs include security Kconfig Makefile \
+              2>/dev/null || true
+          } | tee artifacts/susfs-audit.txt
+
+          echo "SUSFS must be integrated using a compatible 4.19 patch set."
+          echo "This workflow does not silently substitute another kernel or patch."
+          echo "Patch application and config verification are mandatory before release."
+
+      - name: Locate an explicit platform defconfig
+        id: config
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          # This is a platform candidate, NOT proof of OnePlus 8 Pro
+          # compatibility. It is selected only for diagnostic building.
+          if [ -f arch/arm64/configs/vendor/kona-perf_defconfig ]; then
+            DEFCONFIG=vendor/kona-perf_defconfig
+          elif [ -f arch/arm64/configs/kona-perf_defconfig ]; then
+            DEFCONFIG=kona-perf_defconfig
           else
-            printf '\ndo.devicecheck=1;\n' >> AnyKernel3/anykernel.sh
+            echo "::error::No expected Kona platform defconfig found."
+            echo "Review artifacts/device-audit.txt."
+            exit 1
           fi
-          printf 'device.name1=instantnoodlep;\n' >> AnyKernel3/anykernel.sh
-          grep -q '^do.devicecheck=1;' AnyKernel3/anykernel.sh
-          grep -q '^device.name1=instantnoodlep;' AnyKernel3/anykernel.sh
-          cd AnyKernel3
-          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '.git/*' 'README.md' '*placeholder*'
-          cp Image "$GITHUB_WORKSPACE/Image_OnePlus8Pro_LOS24_$(date -u +%Y%m%d)"
 
-      - name: Upload kernel image
+          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+          echo "Selected platform candidate: $DEFCONFIG"
+
+      - name: Configure diagnostic kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          make O="$OUT" ARCH=arm64 \
+            "$DEFCONFIG"
+
+          # Preserve module-loading infrastructure. Do not blindly
+          # convert every =m entry to =y: Kconfig dependencies and
+          # device requirements must determine each driver's state.
+          scripts/config --file "$OUT/.config" --enable MODULES
+
+          make O="$OUT" ARCH=arm64 olddefconfig
+
+          grep -qx 'CONFIG_MODULES=y' "$OUT/.config" || {
+            echo "::error::LKM support is not enabled."
+            exit 1
+          }
+
+          mkdir -p ../artifacts
+          cp "$OUT/.config" ../artifacts/kernel.config
+
+          grep -E '^CONFIG_[A-Za-z0-9_]+=m$' "$OUT/.config" \
+            > ../artifacts/modular-options.txt || true
+
+          grep -E '^CONFIG_(MODULES|KSU|KSU_SUSFS)=' \
+            "$OUT/.config" \
+            > ../artifacts/security-config.txt || true
+
+      - name: Compile diagnostic kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          # First test the selected source/config/toolchain combination.
+          # This is a diagnostic build until device support and SUSFS
+          # have been independently verified.
+          make -j"$(nproc)" \
+            O="$OUT" \
+            ARCH=arm64 \
+            Image.gz dtbs modules
+
+      - name: Validate diagnostic artifacts
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          mkdir -p ../artifacts
+
+          IMAGE="$OUT/arch/arm64/boot/Image.gz"
+
+          test -s "$IMAGE" || {
+            echo "::error::Image.gz is missing or empty."
+            exit 1
+          }
+
+          file "$IMAGE" | tee ../artifacts/image-file.txt
+          sha256sum "$IMAGE" | tee ../artifacts/image-sha256.txt
+          cp "$IMAGE" ../artifacts/Image.gz
+
+          # Record module output without pretending that these modules
+          # are automatically compatible with every target ROM.
+          MODULES_DIR="$OUT"
+          find "$MODULES_DIR" -type f -name '*.ko' -print \
+            | sort > ../artifacts/modules-list.txt
+
+          git rev-parse HEAD > ../artifacts/kernel-commit.txt
+          git submodule status > ../artifacts/submodules.txt
+
+          {
+            echo "Result: diagnostic build only"
+            echo "Device: $DEVICE"
+            echo "LKM infrastructure: checked"
+            echo "SUSFS: not release-verified by this workflow"
+            echo "Device boot test: not performed"
+            echo "Flashable ZIP: intentionally not generated"
+          } > ../artifacts/build-status.txt
+
+      - name: Upload diagnostic artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: OnePlus8Pro-LOS24-Kernel-Image
-          path: Image_OnePlus8Pro_LOS24_*
-          if-no-files-found: error
+          name: singularity-event-horizon-validation
+          path: artifacts/
+          if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload AnyKernel3 ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Create GitHub Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ksu-next-susfs-los24-${{ github.run_number }}
-          name: KernelSU-Next + SUSFS LOS24 Build ${{ github.run_number }}
-          body: |
-            Kernel build target: OnePlus 8 Pro (instantnoodlep)
-            Kernel source: ${{ env.KERNEL_SOURCE }}
-            Kernel branch: ${{ env.KERNEL_BRANCH }}
-
-            This release contains a kernel image and an AnyKernel3 package.
-            Successful compilation does not guarantee device boot compatibility.
-          files: |
-            ${{ env.ZIP_NAME }}
-            Image_OnePlus8Pro_LOS24_*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
