@@ -3,17 +3,20 @@ name: Singularity Event Horizon - OnePlus 8 Pro Validation
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/singularity-event-horizon.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: singularity-event-horizon-validation
+  group: singularity-event-horizon-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  validate-and-build:
-    name: Source, configuration and diagnostic build
+  build:
+    name: Build and Validate Kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -22,38 +25,44 @@ jobs:
       KERNEL_BRANCH: event-horizon
       DEVICE: instantnoodlep
       ARCH: arm64
-      OUT: out
+      SUBARCH: arm64
       LLVM: "1"
+      OUT: ${{ github.workspace }}/kernel-out
 
     steps:
-      - name: Prepare artifact directory
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-
       - name: Install build dependencies
         shell: bash
         run: |
-          set -euo pipefail
-
+          set -euxo pipefail
           sudo apt-get update
-
           sudo apt-get install -y \
-            bc bison build-essential ccache clang \
-            flex git libelf-dev libssl-dev lld llvm \
-            python3 python-is-python3 rsync unzip zip \
-            zstd dwarves device-tree-compiler \
-            patch curl file perl
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            ccache \
+            clang \
+            cmake \
+            curl \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            lld \
+            llvm \
+            make \
+            pahole \
+            python3 \
+            python3-pip \
+            rsync \
+            unzip \
+            zip \
+            zlib1g-dev
 
-          clang --version
-          ld.lld --version
-          git --version
-
-      - name: Clone exact Singularity source and submodules
+      - name: Checkout exact Singularity branch
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
           git clone \
             --branch "$KERNEL_BRANCH" \
@@ -63,317 +72,447 @@ jobs:
 
           cd kernel
 
-          test "$(git branch --show-current)" = "$KERNEL_BRANCH"
-
-          git submodule sync --recursive
+          git checkout "$KERNEL_BRANCH"
           git submodule update --init --recursive
 
-          git rev-parse HEAD \
-            | tee "$GITHUB_WORKSPACE/artifacts/kernel-commit.txt"
+          echo "===== Kernel source ====="
+          git remote -v
+          git branch --show-current
+          git rev-parse HEAD
+          git status --short
 
-          git remote -v \
-            > "$GITHUB_WORKSPACE/artifacts/git-remotes.txt"
+          echo "===== Submodule revisions ====="
+          git submodule status --recursive
 
-          git status --short \
-            > "$GITHUB_WORKSPACE/artifacts/source-status.txt"
+          test "$(git branch --show-current)" = "$KERNEL_BRANCH"
+          test -f Makefile
 
-          git submodule status \
-            > "$GITHUB_WORKSPACE/artifacts/submodules.txt"
-
-          {
-            echo "Source: $KERNEL_SOURCE"
-            echo "Branch: $KERNEL_BRANCH"
-            echo "Device requested: OnePlus 8 Pro"
-            echo "Codename: $DEVICE"
-            echo
-            echo "Kernel commit:"
-            git rev-parse HEAD
-            echo
-            echo "Submodules:"
-            git submodule status
-          } | tee "$GITHUB_WORKSPACE/artifacts/source-audit.txt"
-
-      - name: Validate KernelSU-Next submodule checkout
+      - name: Verify KernelSU-Next checkout
         shell: bash
         working-directory: kernel
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          KSU_DIR="KernelSU-Next"
-
-          if [ ! -d "$KSU_DIR" ] ||
-             [ -z "$(ls -A "$KSU_DIR" 2>/dev/null)" ]; then
-            echo "::error::KernelSU-Next submodule is missing or empty."
-            exit 1
-          fi
-
-          KSU_COMMIT="$(git -C "$KSU_DIR" rev-parse HEAD)"
-
-          {
-            echo "KernelSU-Next path: $KSU_DIR"
-            echo "KernelSU-Next commit: $KSU_COMMIT"
-            echo
-            echo "Submodule status:"
-            git submodule status -- "$KSU_DIR"
-            echo
-            echo "Build and configuration files:"
-            find "$KSU_DIR" -maxdepth 4 -type f \
-              \( -name Makefile -o -name Kconfig \) \
-              -print | sort
-          } | tee "$GITHUB_WORKSPACE/artifacts/kernelsu-checkout.txt"
-
-          echo "Submodule checkout verified."
-          echo "Build integration still requires separate verification."
-
-      - name: Audit device configuration and device trees
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-
-          {
-            echo "Requested device: OnePlus 8 Pro ($DEVICE)"
-            echo
-            echo "Kernel version:"
-            make kernelversion
-            echo
-            echo "Device-specific and platform defconfigs:"
-            find arch/arm64/configs -type f \
-              \( -iname "*instantnoodlep*" \
-                 -o -iname "*instantnoodle*" \
-                 -o -iname "*kebab*" \
-                 -o -iname "*kona*defconfig" \) \
-              -print | sort
-            echo
-            echo "Device tree references:"
-            if [ -d arch/arm64/boot/dts ]; then
-              grep -Ril \
-                --include='*.dts' \
-                --include='*.dtsi' \
-                'instantnoodlep' \
-                arch/arm64/boot/dts || true
-            else
-              echo "No arch/arm64/boot/dts directory found."
+          if [ -d KernelSU-Next/.git ] || \
+             git submodule status KernelSU-Next 2>/dev/null | grep -q .; then
+            echo "KernelSU-Next directory detected."
+            if [ -d KernelSU-Next ]; then
+              git -C KernelSU-Next rev-parse HEAD || true
+              git -C KernelSU-Next status --short || true
             fi
-          } | tee "$GITHUB_WORKSPACE/artifacts/device-audit.txt"
-
-          if find arch/arm64/configs -type f \
-            -iname '*instantnoodlep*' -print -quit \
-            | grep -q .; then
-            echo "Explicit device-named defconfig found." \
-              > "$GITHUB_WORKSPACE/artifacts/device-support-status.txt"
           else
-            {
-              echo "No explicitly named instantnoodlep defconfig found."
-              echo "A Kona defconfig alone does not prove device compatibility."
-            } > "$GITHUB_WORKSPACE/artifacts/device-support-status.txt"
+            echo "::warning::KernelSU-Next was not detected as a populated submodule."
           fi
 
-      - name: Audit KernelSU-Next integration
+          if [ -d KernelSU-Next ]; then
+            find KernelSU-Next -maxdepth 2 -type f \
+              \( -name 'Kconfig' -o -name 'Makefile' \) \
+              -print | head -80 || true
+          fi
+
+      - name: Audit device and defconfig support
         shell: bash
+        working-directory: kernel
         run: |
           set -euo pipefail
 
-          cd "$GITHUB_WORKSPACE/kernel"
+          echo "===== Device references ====="
+          git grep -niE \
+            'instantnoodlep|OnePlus 8 Pro|OnePlus8Pro' \
+            HEAD -- \
+            'arch/arm64/*' \
+            '*/kona*' \
+            '*/instantnoodlep*' \
+            2>/dev/null || true
 
-          {
-            echo "KernelSU-Next integration reference audit"
-            echo
-            grep -Rni \
-              --include=Makefile \
-              --include=Kconfig \
-              --include=Kbuild \
-              --exclude-dir=.git \
-              --exclude-dir=out \
-              'KernelSU-Next\|KSU' \
-              Makefile Kbuild Kconfig arch scripts security include \
-              2>/dev/null || true
-          } > "$GITHUB_WORKSPACE/artifacts/kernelsu-integration-audit.txt"
+          echo "===== Kona defconfigs ====="
+          find arch/arm64/configs -type f \
+            -iname '*kona*defconfig' -print | sort || true
 
-          cat "$GITHUB_WORKSPACE/artifacts/kernelsu-integration-audit.txt"
+          echo "===== Device tree references ====="
+          find arch/arm64/boot/dts -type f \
+            \( -iname '*kona*' -o -iname '*instantnoodlep*' \) \
+            -print 2>/dev/null | head -200 || true
 
-          echo
-          echo "Reference matches are evidence for inspection, not proof of a working integration."
+          echo "===== Compatibility warning ====="
+          echo "A Kona defconfig or Snapdragon 865 support alone does not prove"
+          echo "OnePlus 8 Pro compatibility. Device-specific validation is required."
 
-      - name: Audit existing SUSFS integration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel"
-
-          {
-            echo "SUSFS source and configuration audit"
-            echo
-            grep -Rni \
-              --include=Makefile \
-              --include=Kconfig \
-              --include=Kbuild \
-              --include='*.c' \
-              --include='*.h' \
-              --exclude-dir=.git \
-              --exclude-dir=out \
-              'susfs' \
-              fs include security kernel \
-              2>/dev/null || true
-          } > "$GITHUB_WORKSPACE/artifacts/susfs-audit.txt"
-
-          cat "$GITHUB_WORKSPACE/artifacts/susfs-audit.txt"
-
-          echo
-          echo "This step audits existing references only."
-          echo "It does not apply SUSFS patches or claim SUSFS is integrated."
-
-      - name: Select available Kona diagnostic defconfig
+      - name: Select an available Kona defconfig
         id: config
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          DEFCONFIG="$(
+          mapfile -t DEFCONFIGS < <(
             find arch/arm64/configs -type f \
-              -iname '*kona*defconfig' \
-              -print | sort | head -n 1
-          )"
+              -iname '*kona*defconfig' | sort
+          )
 
-          if [ -z "$DEFCONFIG" ]; then
-            echo "::error::No Kona diagnostic defconfig was found."
+          if [ "${#DEFCONFIGS[@]}" -eq 0 ]; then
+            echo "::error::No Kona defconfig was found."
+            echo "Refusing to guess a different device configuration."
             exit 1
           fi
 
-          DEFCONFIG="${DEFCONFIG#arch/arm64/configs/}"
+          printf '%s\n' "${DEFCONFIGS[@]}"
 
-          echo "defconfig=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+          SELECTED=""
 
-          echo "Selected diagnostic defconfig: $DEFCONFIG" \
-            | tee "$GITHUB_WORKSPACE/artifacts/selected-defconfig.txt"
+          for candidate in \
+            arch/arm64/configs/vendor/kona-perf_defconfig \
+            arch/arm64/configs/kona-perf_defconfig \
+            arch/arm64/configs/vendor/kona_defconfig \
+            arch/arm64/configs/kona_defconfig
+          do
+            if [ -f "$candidate" ]; then
+              SELECTED="$candidate"
+              break
+            fi
+          done
 
-          echo "WARNING: This platform configuration is not proof of OnePlus 8 Pro support."
-
-      - name: Configure diagnostic kernel and retain LKM support
-        shell: bash
-        working-directory: kernel
-        env:
-          DEFCONFIG: ${{ steps.config.outputs.defconfig }}
-        run: |
-          set -euo pipefail
-
-          make O="$OUT" ARCH="$ARCH" LLVM="$LLVM" "$DEFCONFIG"
-
-          test -f scripts/config || {
-            echo "::error::scripts/config is missing."
-            exit 1
-          }
-
-          scripts/config \
-            --file "$OUT/.config" \
-            --enable MODULES
-
-          make O="$OUT" ARCH="$ARCH" LLVM="$LLVM" olddefconfig
-
-          if ! grep -qx 'CONFIG_MODULES=y' "$OUT/.config"; then
-            echo "::error::LKM support is not enabled in the resolved configuration."
+          if [ -z "$SELECTED" ]; then
+            echo "::error::Kona defconfigs exist, but none of the expected names matched."
+            echo "Inspect the listed files and explicitly choose the correct base config."
             exit 1
           fi
 
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          echo "Selected defconfig: $SELECTED"
+          echo "defconfig=$SELECTED" >> "$GITHUB_OUTPUT"
 
-          cp "$OUT/.config" \
-            "$GITHUB_WORKSPACE/artifacts/kernel.config"
-
-          grep -E '^CONFIG_[A-Za-z0-9_]+=m$' "$OUT/.config" \
-            > "$GITHUB_WORKSPACE/artifacts/modular-options.txt" || true
-
-          grep -E \
-            '^CONFIG_(MODULES|KSU|KSU_SUSFS)(=|_)' \
-            "$OUT/.config" \
-            > "$GITHUB_WORKSPACE/artifacts/security-config.txt" || true
-
-          {
-            echo "Resolved defconfig: $DEFCONFIG"
-            echo "CONFIG_MODULES:"
-            grep '^CONFIG_MODULES=' "$OUT/.config"
-            echo
-            echo "Configured module count:"
-            grep -c -E '^CONFIG_[A-Za-z0-9_]+=m$' "$OUT/.config" || true
-          } | tee "$GITHUB_WORKSPACE/artifacts/configuration-status.txt"
-
-          echo "Note: LKM infrastructure is retained."
-          echo "Drivers are not blindly converted from modules to built-ins."
-
-      - name: Compile diagnostic kernel, device trees and modules
+      - name: Configure kernel with loadable module support
         shell: bash
         working-directory: kernel
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          make -j"$(nproc)" \
+          mkdir -p "$OUT"
+
+          make \
             O="$OUT" \
             ARCH="$ARCH" \
+            SUBARCH="$SUBARCH" \
             LLVM="$LLVM" \
-            Image.gz dtbs modules \
-            2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+            "$DEFCONFIG"
 
-      - name: Validate diagnostic build outputs
-        if: success()
+          test -x scripts/config
+
+          scripts/config --file "$OUT/.config" --enable MODULES
+
+          make \
+            O="$OUT" \
+            ARCH="$ARCH" \
+            SUBARCH="$SUBARCH" \
+            LLVM="$LLVM" \
+            olddefconfig
+
+          echo "===== Module configuration ====="
+          grep -E '^CONFIG_MODULES=|^# CONFIG_MODULES is not set' \
+            "$OUT/.config" || true
+
+          if ! grep -qx 'CONFIG_MODULES=y' "$OUT/.config"; then
+            echo "::error::CONFIG_MODULES=y did not survive olddefconfig."
+            exit 1
+          fi
+
+          cp "$OUT/.config" "$GITHUB_WORKSPACE/kernel-config.txt"
+
+          echo "LKM support is enabled."
+          echo "Individual drivers remain built-in or modular according to"
+          echo "their resolved configuration. They cannot be both =y and =m."
+
+      - name: Fix missing BPF JIT fallback safely
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
 
-          ARTIFACTS="$GITHUB_WORKSPACE/artifacts"
-          IMAGE="$OUT/arch/arm64/boot/Image.gz"
+          HEADER="include/linux/filter.h"
 
-          test -s "$IMAGE" || {
-            echo "::error::Expected Image.gz was not produced."
+          if [ ! -f "$HEADER" ]; then
+            echo "::error::Missing $HEADER; cannot inspect BPF helper."
             exit 1
+          fi
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path("include/linux/filter.h")
+          text = path.read_text()
+
+          signature = (
+              r"static\s+inline\s+bool\s+"
+              r"bpf_jit_blinding_enabled\s*"
+              r"\(\s*struct\s+bpf_prog\s*\*\s*prog\s*\)"
+          )
+
+          marker = re.search(
+              r"^[ \t]*#\s*else\s*/\*\s*CONFIG_BPF_JIT\s*\*/[^\n]*",
+              text,
+              flags=re.MULTILINE,
+          )
+
+          if not marker:
+              print(
+                  "::error::Could not find the exact "
+                  "'#else /* CONFIG_BPF_JIT */' section."
+              )
+              print("No automatic source modification was made.")
+              sys.exit(1)
+
+          tail = text[marker.end():]
+
+          end_match = re.search(
+              r"^[ \t]*#\s*endif\b[^\n]*CONFIG_BPF_JIT[^\n]*",
+              tail,
+              flags=re.MULTILINE,
+          )
+
+          if not end_match:
+              print(
+                  "::error::Could not identify the end of the "
+                  "CONFIG_BPF_JIT conditional section."
+              )
+              print("No automatic source modification was made.")
+              sys.exit(1)
+
+          fallback_end = marker.end() + end_match.start()
+          fallback_section = text[marker.end():fallback_end]
+          fallback_signatures = list(
+              re.finditer(signature, fallback_section)
+          )
+
+          all_signatures = list(re.finditer(signature, text))
+
+          if len(fallback_signatures) == 1:
+              print("BPF JIT fallback already exists; no change required.")
+              sys.exit(0)
+
+          if len(fallback_signatures) > 1:
+              print(
+                  "::error::Multiple BPF helper definitions exist "
+                  "in the CONFIG_BPF_JIT fallback section."
+              )
+              sys.exit(1)
+
+          if not all_signatures:
+              print(
+                  "::error::No existing helper definition was found. "
+                  "The source may need a different, version-specific fix."
+              )
+              sys.exit(1)
+
+          if len(all_signatures) != 1:
+              print(
+                  "::error::Unexpected number of helper definitions; "
+                  "refusing to guess which one to modify."
+              )
+              sys.exit(1)
+
+          fallback = """
+          static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
+          {
+              return false;
           }
 
-          file "$IMAGE" | tee "$ARTIFACTS/image-file.txt"
-          sha256sum "$IMAGE" | tee "$ARTIFACTS/image-sha256.txt"
+          """
 
-          cp "$IMAGE" "$ARTIFACTS/Image.gz"
+          updated = (
+              text[:fallback_end]
+              + fallback
+              + text[fallback_end:]
+          )
 
-          find "$OUT" -type f -name '*.ko' -print | sort \
-            > "$ARTIFACTS/modules-list.txt"
+          path.write_text(updated)
 
-          find "$OUT" -type f -name '*.dtb' -print | sort \
-            > "$ARTIFACTS/dtb-list.txt"
+          print("Inserted the missing CONFIG_BPF_JIT fallback.")
+          print("The fallback returns false when BPF JIT is disabled.")
+          PY
 
-          git rev-parse HEAD > "$ARTIFACTS/kernel-commit.txt"
-          git submodule status > "$ARTIFACTS/submodules.txt"
+          echo "===== BPF helper definitions after check ====="
+          grep -n -A4 -B2 \
+            'bpf_jit_blinding_enabled' "$HEADER" || true
 
-          {
-            echo "Diagnostic kernel compilation: passed"
-            echo "Kernel image exists: yes"
-            echo "LKM support: CONFIG_MODULES=y verified"
-            echo "KernelSU-Next: checkout verified; integration not yet proven"
-            echo "SUSFS: not integrated or release-verified by this workflow"
-            echo "OnePlus 8 Pro boot test: not performed"
-            echo "Flashable ZIP: not generated"
-          } | tee "$ARTIFACTS/build-status.txt"
+      - name: Audit KernelSU and SUSFS integration
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
 
-      - name: Upload validation artifacts and logs
+          echo "===== KernelSU references ====="
+          git grep -niE \
+            'KernelSU|kernelsu|ksu_init|CONFIG_KSU' \
+            HEAD -- \
+            'Kconfig' \
+            'Makefile' \
+            'init/*' \
+            'drivers/*' \
+            'fs/*' \
+            2>/dev/null | head -250 || true
+
+          echo "===== SUSFS references ====="
+          git grep -niE \
+            'susfs|CONFIG_KSU_SUSFS|ksu_susfs' \
+            HEAD -- \
+            'Kconfig' \
+            'Makefile' \
+            'fs/*' \
+            'include/*' \
+            'drivers/*' \
+            2>/dev/null | head -250 || true
+
+          echo "===== SUSFS integration status ====="
+          if git grep -qiE 'susfs|CONFIG_KSU_SUSFS' HEAD -- \
+            'Kconfig' 'Makefile' 'fs/*' 'include/*' 'drivers/*' \
+            2>/dev/null; then
+            echo "Some SUSFS references exist."
+            echo "This does not prove the required patch set is fully integrated."
+          else
+            echo "::warning::No SUSFS integration references were detected."
+          fi
+
+          echo "No SUSFS patch is claimed as applied by this audit step."
+
+      - name: Build kernel image, device trees, and modules
+        id: build
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -uo pipefail
+
+          mkdir -p "$OUT"
+          set +e
+
+          make \
+            -j"$(nproc)" \
+            O="$OUT" \
+            ARCH="$ARCH" \
+            SUBARCH="$SUBARCH" \
+            LLVM="$LLVM" \
+            Image.gz dtbs modules \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          status=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Kernel build failed with exit code $status."
+            echo "===== Relevant compiler diagnostics ====="
+            grep -n -B5 -A8 -E \
+              'error:|fatal error:|undefined reference|Error [0-9]' \
+              "$GITHUB_WORKSPACE/build.log" | tail -250 || true
+            exit "$status"
+          fi
+
+      - name: Validate build artifacts
+        if: success()
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== Candidate images ====="
+          find "$OUT/arch/arm64/boot" -maxdepth 3 -type f \
+            \( -name 'Image' -o -name 'Image.gz' \
+               -o -name 'Image.gz-dtb' -o -name '*.dtb' \
+               -o -name '*.dtbo' \) \
+            -print | sort || true
+
+          echo "===== Built modules ====="
+          find "$OUT" -type f -name '*.ko' -print | sort || true
+
+          if [ ! -s "$OUT/arch/arm64/boot/Image.gz" ] && \
+             [ ! -s "$OUT/arch/arm64/boot/Image" ]; then
+            echo "::error::No non-empty kernel Image or Image.gz was produced."
+            exit 1
+          fi
+
+          if [ ! -s "$OUT/.config" ]; then
+            echo "::error::Final kernel configuration is missing."
+            exit 1
+          fi
+
+          grep -qx 'CONFIG_MODULES=y' "$OUT/.config"
+
+          echo "Basic artifact checks passed."
+          echo "This does not prove that the kernel boots on instantnoodlep."
+
+      - name: Collect diagnostic artifacts
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+
+          if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
+            cp "$GITHUB_WORKSPACE/build.log" \
+              "$GITHUB_WORKSPACE/diagnostics/"
+          fi
+
+          if [ -f "$GITHUB_WORKSPACE/kernel-config.txt" ]; then
+            cp "$GITHUB_WORKSPACE/kernel-config.txt" \
+              "$GITHUB_WORKSPACE/diagnostics/"
+          fi
+
+          if [ -d "$GITHUB_WORKSPACE/kernel" ]; then
+            (
+              cd "$GITHUB_WORKSPACE/kernel"
+              git rev-parse HEAD
+              git branch --show-current
+              git submodule status --recursive
+            ) > "$GITHUB_WORKSPACE/diagnostics/source-revisions.txt" 2>&1
+
+            if [ -f "$GITHUB_WORKSPACE/kernel/include/linux/filter.h" ]; then
+              grep -n -A5 -B3 \
+                'bpf_jit_blinding_enabled' \
+                "$GITHUB_WORKSPACE/kernel/include/linux/filter.h" \
+                > "$GITHUB_WORKSPACE/diagnostics/bpf-helper.txt" 2>&1
+            fi
+          fi
+
+          if [ -f "$OUT/.config" ]; then
+            cp "$OUT/.config" \
+              "$GITHUB_WORKSPACE/diagnostics/final-kernel.config"
+          fi
+
+          if [ -d "$OUT/arch/arm64/boot" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/diagnostics/boot"
+            find "$OUT/arch/arm64/boot" -maxdepth 3 -type f \
+              \( -name 'Image' -o -name 'Image.gz' \
+                 -o -name '*.dtb' -o -name '*.dtbo' \) \
+              -exec cp --parents '{}' \
+                "$GITHUB_WORKSPACE/diagnostics/boot" \; 2>/dev/null
+          fi
+
+      - name: Upload kernel and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: singularity-event-horizon-validation
-          path: artifacts/
+          name: singularity-event-horizon-${{ github.run_number }}
+          path: |
+            kernel-out/arch/arm64/boot/Image
+            kernel-out/arch/arm64/boot/Image.gz
+            kernel-out/arch/arm64/boot/dts/**/*.dtb
+            kernel-out/arch/arm64/boot/dts/**/*.dtbo
+            kernel-out/.config
+            kernel-config.txt
+            build.log
+            diagnostics/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Summarize validation status
+      - name: Report validation status
         if: always()
         shell: bash
         run: |
-          {
-            echo "## Singularity Event Horizon Validation"
-            echo
-            echo "- Source: \`$KERNEL_SOURCE\`"
-            echo "- Branch: \`$KERNEL_BRANCH\`"
-            echo "- Requested device: \`$DEVICE\`"
-            echo "- This workflow is diagnostic only."
-            echo "- No flashable ZIP is produced."
-            echo "- SUSFS integration and device compatibility require further verification."
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: $KERNEL_SOURCE"
+          echo "Branch: $KERNEL_BRANCH"
+          echo "Requested device: $DEVICE"
+          echo "LKM support: CONFIG_MODULES=y required"
+          echo "Flashable ZIP: intentionally not generated"
+          echo "Device boot compatibility: not established by compilation alone"
