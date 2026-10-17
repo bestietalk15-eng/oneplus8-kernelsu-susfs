@@ -1,11 +1,11 @@
 
-name: Build Singularity Kernel with KernelSU-Next and SUSFS
+name: Singularity Event Horizon Kernel Build
 
 on:
   workflow_dispatch:
     inputs:
       build_modules:
-        description: "Build and archive loadable kernel modules"
+        description: "Build loadable kernel modules (.ko)"
         required: true
         default: true
         type: boolean
@@ -16,10 +16,8 @@ permissions:
 env:
   KERNEL_SOURCE: https://github.com/The-Anomalist/Singularity.git
   KERNEL_BRANCH: event-horizon
-  SUSFS_SOURCE: https://gitlab.com/simonpunk/susfs4ksu.git
-  SUSFS_BRANCH: kernel-4.19
   DEVICE_CODENAME: instantnoodlep
-  KERNEL_OUT: kernel-out
+  KERNEL_OUT: out
 
 jobs:
   build:
@@ -39,28 +37,40 @@ jobs:
             bc bison build-essential cpio curl flex git \
             libelf-dev libssl-dev lz4 make python3 \
             python-is-python3 rsync zip unzip dwarves patch \
-            clang llvm lld gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone exact kernel source and branch
+      - name: Download Clang toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+
+          curl --fail --location --retry 3 \
+            'https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz' \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
+            -C "$RUNNER_TEMP/clang"
+
+          test -x "$RUNNER_TEMP/clang/bin/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version
+
+      - name: Clone exact Singularity source
         shell: bash
         run: |
           set -euxo pipefail
 
           git clone --recurse-submodules --single-branch \
-            --branch "$KERNEL_BRANCH" \
-            "$KERNEL_SOURCE" kernel
+            --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
 
           test -s kernel/Makefile
 
-          test "$(git -C kernel branch --show-current)" \
-            = "$KERNEL_BRANCH"
-
           {
-            echo "Kernel source: $KERNEL_SOURCE"
-            echo "Kernel branch: $(git -C kernel branch --show-current)"
-            echo "Kernel commit: $(git -C kernel rev-parse HEAD)"
-            echo "Submodule status:"
+            echo "Source: $KERNEL_SOURCE"
+            echo "Branch: $(git -C kernel branch --show-current)"
+            echo "Commit: $(git -C kernel rev-parse HEAD)"
+            echo "Submodules:"
             git -C kernel submodule status --recursive || true
           } | tee "$GITHUB_WORKSPACE/source-info.txt"
 
@@ -77,7 +87,7 @@ jobs:
             KSU_DIR="drivers/kernelsu"
           else
             echo "::error::Existing drivers/kernelsu integration not found."
-            echo "Refusing to clone or install a different KernelSU tree."
+            echo "This workflow will not install a second KernelSU tree."
             exit 1
           fi
 
@@ -85,132 +95,53 @@ jobs:
           test -s "$KSU_DIR/Makefile"
 
           echo "KernelSU directory: $KSU_DIR"
+          grep -R -n -E \
+            'config KSU|KSU_SUSFS|SUSFS' \
+            "$KSU_DIR" \
+            --include='Kconfig' \
+            --include='Makefile' \
+            --include='*.c' \
+            --include='*.h' \
+            2>/dev/null | head -200 || true
 
-          find "$KSU_DIR" -maxdepth 3 -type f \
-            \( -iname '*susfs*' -o -name Kconfig \) \
-            -print | head -100
-
-      - name: Fetch SUSFS kernel-4.19 patches
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          git clone --depth=1 --single-branch \
-            --branch "$SUSFS_BRANCH" \
-            "$SUSFS_SOURCE" susfs4ksu
-
-          test -s \
-            susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
-
-          test -s \
-            susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-
-          test -s susfs4ksu/kernel_patches/fs/susfs.c
-          test -s susfs4ksu/kernel_patches/include/linux/susfs.h
-
-      - name: Apply SUSFS kernel patch safely
+      - name: Audit existing SUSFS integration without patching
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
 
-          PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
-
-          mkdir -p "$DIAG"
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
 
           {
-            echo "Kernel commit: $(git rev-parse HEAD)"
-            echo "Kernel branch: $(git branch --show-current)"
-            echo "SUSFS branch: $SUSFS_BRANCH"
-            echo "Patch: $PATCH"
-          } | tee "$DIAG/diagnostics.txt"
+            echo "===== Source revision ====="
+            git log -1 --oneline
 
-          if ! patch --batch --forward --dry-run -p1 \
-              < "$PATCH" > "$DIAG/kernel-patch-dry-run.log" 2>&1; then
+            echo "===== Existing SUSFS files ====="
+            find fs include drivers -type f \
+              \( -iname '*susfs*' \) \
+              -print 2>/dev/null | head -200
 
-            cat "$DIAG/kernel-patch-dry-run.log"
+            echo "===== SUSFS source references ====="
+            git grep -n -i susfs -- \
+              fs include/linux kernel drivers/kernelsu \
+              2>/dev/null | head -300 || true
 
-            {
-              echo "SUSFS patch dry-run failed. No patch was applied."
+            echo "===== Filesystem build integration ====="
+            grep -n -i susfs fs/Makefile fs/Kconfig \
+              2>/dev/null || true
 
-              for f in \
-                fs/namespace.c \
-                fs/proc/task_mmu.c \
-                include/linux/mount.h \
-                include/linux/cred.h \
-                fs/internal.h; do
+            echo "===== Existing KernelSU SUSFS references ====="
+            grep -R -n -i susfs drivers/kernelsu \
+              --include='Kconfig' \
+              --include='Makefile' \
+              --include='*.c' \
+              --include='*.h' \
+              2>/dev/null | head -200 || true
+          } | tee "$GITHUB_WORKSPACE/diagnostics/susfs-audit.txt"
 
-                if [ -f "$f" ]; then
-                  echo "===== $f ====="
-                  grep -n -E \
-                    'path_umount|get_cred_rcu|susfs|struct path|struct cred' \
-                    "$f" | head -100 || true
-                fi
-              done
-            } >> "$DIAG/diagnostics.txt"
+          echo "Audit only: no SUSFS patches have been downloaded or applied."
 
-            echo "::error::SUSFS patch is incompatible with this source revision."
-            echo "Review the SUSFS-patch-diagnostics artifact."
-            exit 1
-          fi
-
-          patch --batch --forward -p1 < "$PATCH"
-
-          cp \
-            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/susfs.c" \
-            fs/susfs.c
-
-          install -m 0644 \
-            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/susfs.h" \
-            include/linux/susfs.h
-
-          grep -q 'susfs.o' fs/Makefile || {
-            echo "::error::fs/Makefile does not reference susfs.o."
-            exit 1
-          }
-
-          if find . -type f -name '*.rej' -print -quit | grep -q .; then
-            find . -type f -name '*.rej' -print
-            echo "::error::Rejected patch files remain."
-            exit 1
-          fi
-
-      - name: Apply SUSFS patch to existing KernelSU-Next
-        working-directory: kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          KSU_PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-
-          if [ -L drivers/kernelsu ]; then
-            KSU_DIR="$(readlink -f drivers/kernelsu)"
-          else
-            KSU_DIR="$GITHUB_WORKSPACE/kernel/drivers/kernelsu"
-          fi
-
-          KSU_ROOT="$(
-            git -C "$KSU_DIR" rev-parse --show-toplevel 2>/dev/null \
-              || dirname "$KSU_DIR"
-          )"
-
-          mkdir -p "$GITHUB_WORKSPACE/susfs-diagnostics"
-
-          if patch --batch --forward --dry-run \
-              -d "$KSU_ROOT" -p1 \
-              < "$KSU_PATCH" \
-              > "$GITHUB_WORKSPACE/susfs-diagnostics/ksu-patch-dry-run.log" 2>&1; then
-
-            patch --batch --forward \
-              -d "$KSU_ROOT" -p1 < "$KSU_PATCH"
-          else
-            cat "$GITHUB_WORKSPACE/susfs-diagnostics/ksu-patch-dry-run.log"
-            echo "::error::SUSFS patch does not match this KernelSU-Next tree."
-            exit 1
-          fi
-
-      - name: Fix Qualcomm charger header dependency
+      - name: Check Qualcomm charger headers
         working-directory: kernel
         shell: bash
         run: |
@@ -219,29 +150,22 @@ jobs:
           SRC="drivers/power/supply/qcom/schgm-flash.c"
           HDR="drivers/power/supply/qcom/schgm-flash.h"
           LIB="drivers/power/supply/qcom/smb5-lib.h"
-          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
 
-          mkdir -p "$DIAG"
-
-          test -s "$SRC" || {
-            echo "::error::schgm-flash.c is missing."
-            exit 1
-          }
-
-          test -s "$HDR" || {
-            echo "::error::schgm-flash.h is missing."
-            exit 1
-          }
-
-          test -s "$LIB" || {
-            echo "::error::smb5-lib.h is missing."
-            exit 1
-          }
+          test -s "$SRC"
+          test -s "$HDR"
+          test -s "$LIB"
 
           {
-            echo "Before fix: $SRC"
-            sed -n '1,45p' "$SRC"
-          } | tee "$DIAG/schgm-flash-header-fix.log"
+            echo "===== Current schgm-flash.c ====="
+            sed -n '1,100p' "$SRC"
+
+            echo "===== Charger declarations ====="
+            grep -R -n -E \
+              'struct smb_charger|struct smb_irq_data|smblib_read|smblib_write' \
+              drivers/power/supply/qcom \
+              --include='*.h' --include='*.c' \
+              | head -200 || true
+          } | tee "$GITHUB_WORKSPACE/diagnostics/charger-headers.txt"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -253,12 +177,37 @@ jobs:
 
           source = src.read_text()
           header = hdr.read_text()
-          library_header = lib.read_text()
+          lib_text = lib.read_text()
 
-          # The implementation uses smb_charger, smb_irq_data,
-          # smblib_read() and smblib_write(). Include the API header
-          # before schgm-flash.h so the definitions are available.
+          # Verify that the charger API declarations exist somewhere
+          # in this source tree before attempting the include adjustment.
+          root = Path("drivers/power/supply/qcom")
+          all_headers = "\n".join(
+              p.read_text(errors="ignore")
+              for p in root.rglob("*.h")
+          )
 
+          required = [
+              "struct smb_charger",
+              "struct smb_irq_data",
+              "smblib_read",
+              "smblib_write",
+          ]
+
+          missing = [
+              item for item in required
+              if item not in all_headers and item not in lib_text
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Expected Qualcomm declarations were not found: "
+                  + ", ".join(missing)
+                  + ". No speculative compatibility edit was made."
+              )
+
+          # Include smb5-lib.h before schgm-flash.h, so the charger
+          # API declarations are visible when schgm-flash.h is parsed.
           if not re.search(
               r'^\s*#\s*include\s*[<"]smb5-lib\.h[">]',
               source,
@@ -272,8 +221,8 @@ jobs:
 
               if len(matches) != 1:
                   raise SystemExit(
-                      'Expected exactly one schgm-flash.h include; '
-                      'refusing an ambiguous source edit.'
+                      "Could not uniquely locate schgm-flash.h include. "
+                      "No speculative source edit was made."
                   )
 
               match = matches[0]
@@ -284,7 +233,8 @@ jobs:
               )
               src.write_text(source)
 
-          # Keep the public header safe to include independently.
+          # A pointer parameter can use a forward declaration.
+          # Do not add it if the header already has one.
           if not re.search(
               r'^\s*struct\s+smb_charger\s*;',
               header,
@@ -298,49 +248,26 @@ jobs:
 
               if not guard:
                   raise SystemExit(
-                      'Could not identify schgm-flash.h include guard.'
+                      "Cannot identify schgm-flash.h include guard."
                   )
 
               pos = guard.end()
               header = (
                   header[:pos]
-                  + '\n\nstruct smb_charger;\n'
+                  + "\n\nstruct smb_charger;\n"
                   + header[pos:]
               )
               hdr.write_text(header)
 
-          # Fail rather than silently continue if the expected API
-          # declarations are absent from this kernel's own header.
-          required = [
-              "struct smb_charger",
-              "struct smb_irq_data",
-              "smblib_read",
-              "smblib_write",
-          ]
-
-          missing = [
-              symbol for symbol in required
-              if symbol not in library_header
-          ]
-
-          if missing:
-              raise SystemExit(
-                  "smb5-lib.h lacks expected symbols: "
-                  + ", ".join(missing)
-              )
-
-          print("Verified smb5-lib.h and applied guarded header fix.")
+          print("Charger header checks completed.")
           PY
 
-          grep -n 'smb5-lib.h' "$SRC"
-          grep -n 'struct smb_charger;' "$HDR"
-
           {
-            echo "After fix: $SRC"
-            sed -n '1,45p' "$SRC"
-          } | tee -a "$DIAG/schgm-flash-header-fix.log"
+            echo "===== Resulting source includes ====="
+            sed -n '1,55p' "$SRC"
+          } | tee -a "$GITHUB_WORKSPACE/diagnostics/charger-headers.txt"
 
-      - name: Select and configure kernel defconfig
+      - name: Locate and configure defconfig
         id: config
         working-directory: kernel
         shell: bash
@@ -364,7 +291,7 @@ jobs:
           done
 
           if [ -z "$DEFCONFIG" ]; then
-            echo "::error::No supported Kona/instantnoodle defconfig found."
+            echo "::error::No supported defconfig candidate was found."
             find arch/arm64/configs -maxdepth 4 -type f \
               \( -iname '*kona*' -o -iname '*instantnoodle*' \) \
               -print | head -150
@@ -372,13 +299,13 @@ jobs:
           fi
 
           DEFCONFIG_NAME="${DEFCONFIG#arch/arm64/configs/}"
-
           echo "Selected defconfig: $DEFCONFIG"
           echo "defconfig=$DEFCONFIG_NAME" >> "$GITHUB_OUTPUT"
 
           mkdir -p "$KERNEL_OUT"
 
-          make O="$KERNEL_OUT" ARCH=arm64 LLVM=1 "$DEFCONFIG_NAME"
+          make O="$KERNEL_OUT" ARCH=arm64 LLVM=1 \
+            "$DEFCONFIG_NAME"
 
           scripts/config --file "$KERNEL_OUT/.config" \
             -e MODULES \
@@ -395,22 +322,41 @@ jobs:
           }
 
           grep -q '^CONFIG_KSU=y' "$KERNEL_OUT/.config" || {
-            echo "::error::CONFIG_KSU=y did not survive olddefconfig."
+            echo "::error::CONFIG_KSU=y is not enabled."
             exit 1
           }
 
           {
             echo "Defconfig: $DEFCONFIG"
-            echo "Kernel commit: $(git rev-parse HEAD)"
-            echo "Requested device codename: $DEVICE_CODENAME"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo "Device requested: $DEVICE_CODENAME"
+            echo "===== Important config ====="
             grep -E \
               '^CONFIG_(MODULES|KSU|KPROBES|KSU_SUSFS)=' \
               "$KERNEL_OUT/.config" || true
+            echo "===== SUSFS-related config ====="
+            grep -i susfs "$KERNEL_OUT/.config" || true
           } | tee "$GITHUB_WORKSPACE/kernel-config-summary.txt"
 
-          cp "$KERNEL_OUT/.config" "$GITHUB_WORKSPACE/kernel.config"
+          cp "$KERNEL_OUT/.config" \
+            "$GITHUB_WORKSPACE/kernel.config"
 
-      - name: Build kernel image, device trees, and optional modules
+      - name: Validate existing SUSFS configuration
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -q '^CONFIG_KSU_SUSFS=y' "$KERNEL_OUT/.config"; then
+            echo "CONFIG_KSU_SUSFS=y"
+          else
+            echo "::error::CONFIG_KSU_SUSFS=y is not enabled in the final config."
+            echo "This workflow will not add SUSFS patches to compensate."
+            echo "Inspect kernel-config-summary.txt and susfs-audit.txt."
+            exit 1
+          fi
+
+      - name: Build kernel image and device trees
         working-directory: kernel
         env:
           DEFCONFIG: ${{ steps.config.outputs.defconfig }}
@@ -423,8 +369,6 @@ jobs:
             exit 1
           }
 
-          echo "Building configured target: $DEFCONFIG"
-
           make -j"$(nproc --all)" \
             O="$KERNEL_OUT" ARCH=arm64 \
             CC=clang LLVM=1 LLVM_IAS=1 \
@@ -435,32 +379,44 @@ jobs:
           test -s "$KERNEL_OUT/arch/arm64/boot/Image.gz" || {
             echo "::error::Image.gz was not produced."
             find "$KERNEL_OUT/arch/arm64/boot" \
-              -maxdepth 2 -type f -print || true
+              -maxdepth 3 -type f -print || true
             exit 1
           }
 
-          if [ "${{ inputs.build_modules }}" = "true" ]; then
-            make -j"$(nproc --all)" \
-              O="$KERNEL_OUT" ARCH=arm64 \
-              CC=clang LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              modules
-
-            mkdir -p "$GITHUB_WORKSPACE/module-staging"
-
-            make O="$KERNEL_OUT" ARCH=arm64 \
-              CC=clang LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              INSTALL_MOD_PATH="$GITHUB_WORKSPACE/module-staging" \
-              modules_install
-
-            find "$GITHUB_WORKSPACE/module-staging" \
-              -type f -name '*.ko' -print
+          if [ -s "$KERNEL_OUT/arch/arm64/boot/Image" ]; then
+            echo "Uncompressed Image also produced."
           fi
 
-      - name: Collect build artifacts and diagnostics
+      - name: Build and stage loadable modules
+        if: ${{ inputs.build_modules }}
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q '^CONFIG_MODULES=y' "$KERNEL_OUT/.config"
+
+          make -j"$(nproc --all)" \
+            O="$KERNEL_OUT" ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            modules
+
+          mkdir -p "$GITHUB_WORKSPACE/module-staging"
+
+          make O="$KERNEL_OUT" ARCH=arm64 \
+            CC=clang LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/module-staging" \
+            modules_install
+
+          find "$GITHUB_WORKSPACE/module-staging" \
+            -type f -name '*.ko' -print \
+            | tee "$GITHUB_WORKSPACE/diagnostics/modules-list.txt"
+
+      - name: Collect artifacts and diagnostics
         if: always()
         shell: bash
         run: |
@@ -495,15 +451,15 @@ jobs:
               -C module-staging .
           fi
 
-          if [ -d susfs-diagnostics ]; then
-            cp -a susfs-diagnostics artifacts/
+          if [ -d diagnostics ]; then
+            cp -a diagnostics artifacts/
           fi
 
-      - name: Upload build artifacts and diagnostics
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Singularity-event-horizon-build-${{ github.run_number }}
+          name: Singularity-event-horizon-${{ github.run_number }}
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
